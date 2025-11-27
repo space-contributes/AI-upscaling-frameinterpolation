@@ -1,9 +1,9 @@
 # SuperRes Supervisor* — AI-Powered Real-Time Display Enhancement - C++ - CUDA - DirectX 11 - Cross-platform
 
 ### **Live 9 MHz GPU-Accelerated Visual Enhancement. Physically Accurate Motion Estimation**
-#### Windows 10/11 - NVIDIA GPU Required (CUDA 13.0+) - Real-time Desktop Upscaling
-
-##### **SuperRes Supervisor** is a **next-generation GPU-accelerated display enhancement engine** that delivers **live 8K upscaling, CUDA-powered motion estimation, AI-adaptive frame interpolation, and DirectComposition overlay rendering** with **sub-millisecond latency, multi-threaded processing, and self-learning quality optimization** — all **optimized at the CUDA kernel level for true cinematic clarity.**
+#### Windows 10/11 - NVIDIA GPU Required (CUDA 13.0+) - Real-time Desktop Upscaling and Colour enhancement
+### ***SuperRes Supervisor*** is a next-generation GPU-accelerated display enhancement engine that delivers live 8K upscaling, CUDA-powered motion estimation, AI-adaptive frame interpolation, DirectComposition overlay rendering, and dynamic infinite-color gamut adaptation tuned to trick the human visual system for perceptually richer, more vivid colors, all with sub-millisecond latency, multi-threaded processing, and self-learning quality optimization — optimized at the CUDA kernel level for cinematic clarity.
+No external dependencies beyond NVIDIA drivers!
 ##### No external dependencies beyond NVIDIA drivers!
 *Made with ❤️ by Space-code* WITH *CUTTING-EDGE CUDA ACCELERATION*!
 
@@ -114,13 +114,14 @@ supervisor.exe
 * **DirectX 11 Desktop Duplication API** for zero-copy screen capture
 * **DirectComposition overlay rendering** with hardware acceleration
 * **Multi-threaded architecture** with dedicated CUDA streams for parallel processing
-
 ### Visual Enhancement
 * **Edge-preserving upscaling** with adaptive sharpness control
 * **Motion-blur reduction** through intelligent temporal filtering
 * **Detail enhancement** with frequency-domain analysis
 * **Artifact detection and suppression** using quality metrics
 * **Automatic brightness and contrast optimization**
+* **Dynamic infinite-color gamut adaptation** — maps colors across **BT.2020, ProPhoto, P3, and beyond**, enhancing perceptual richness and tricking the human brain to perceive more detail and color depth!
+* **Dyanamic Metadata** -: WOO!
 
 ### Performance & Efficiency
 * **Sub-millisecond latency** through GPU-direct memory access
