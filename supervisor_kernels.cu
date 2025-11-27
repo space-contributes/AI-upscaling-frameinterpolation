@@ -88,6 +88,7 @@ __global__ void motionEstimationKernel(
 }
 
 // Upscaling kernel with color transformation
+// In supervisor_kernels.cu, fix the bracket mismatches and syntax errors
 __global__ void upscalingKernel(
     const unsigned char* input,
     unsigned char* output,
@@ -205,7 +206,6 @@ __global__ void upscalingKernel(
     output[outIdx + 2] = (unsigned char)CLAMP(r * 255.0f, 0.0f, 255.0f);
     output[outIdx + 3] = 255;
 }
-
 // Color adjustment kernel
 __global__ void AdjustKernel(Color* pixels, int width, int height,
                             float brightness, float gamma, float contrast,
