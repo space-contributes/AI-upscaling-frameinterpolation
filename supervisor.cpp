@@ -1393,27 +1393,41 @@ int main() {
             frameCount++;
             
             // Generate and display interpolated frames
+            a            // Generate and display interpolated frames
             auto interpolatedFrames = generateInterpolatedFrames(TARGET_W_DEFAULT, TARGET_H_DEFAULT);
             for (const auto& interpolatedFrame : interpolatedFrames) {
                 present_via_dcomp(dcompCtx, interpolatedFrame, TARGET_W_DEFAULT, TARGET_H_DEFAULT);
                 frameCount++;
             }
-            using Microsoft::WRL::ComPtr;
 
-// Your existing structs (assuming these exist)
+            // ESC to exit
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+                running = false;
+            }
+
+            // Save model every 300 frames
+            if (frameCount % 300 == 0) {
+                upscalingModel.save(std::string(MODULES_DIR) + "/upscaling_model.bin");
+            }
+
+            sleep_until(lastFrameTime + frameInterval);
+            lastFrameTime = std::chrono::steady_clock::now();
+        }
+    }
+
+    // Final save
+    upscalingModel.save(std::string(MODULES_DIR) + "/upscaling_model.bin");
+
+    freeCudaMemory();
+    cleanupCuda();
+
+    return 0;
+}
+// ——————————————————————————————————————————————
+// REAL-TIME CUDA COLOR OVERLAY (AdjustKernel) — runs forever in background
+// ——————————————————————————————————————————————
 struct Color { float r, g, b, a; };
 
-struct FrameBuffer {
-    void* data = nullptr;
-    int width = 0, height = 0;
-    void* motionField = nullptr; // assuming some motion vector buffer
-    ~FrameBuffer() { /* free data if owned */ }
-};
-
-// Global shutdown flag
-std::atomic<bool> g_Running{ true };
-
-// CUDA Kernel - unchanged, correct
 __global__ void AdjustKernel(Color* pixels, int width, int height,
                             float brightness, float gamma, float contrast,
                             float deltaR, float deltaG, float deltaB)
@@ -1421,228 +1435,175 @@ __global__ void AdjustKernel(Color* pixels, int width, int height,
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
-
     int idx = y * width + x;
     Color c = pixels[idx];
-
     float invGamma = 1.0f / gamma;
     c.r = fminf(fmaxf(powf(c.r * brightness, invGamma) * contrast + deltaR, 0.0f), 1.0f);
     c.g = fminf(fmaxf(powf(c.g * brightness, invGamma) * contrast + deltaG, 0.0f), 1.0f);
     c.b = fminf(fmaxf(powf(c.b * brightness, invGamma) * contrast + deltaB, 0.0f), 1.0f);
-
     pixels[idx] = c;
 }
 
-// Dynamic parameter callbacks (example implementations - replace with your real ones)
-float GetBrightness() { return 1.2f; }
-float GetGamma()      { return 1.8f; }
-float GetContrast()   { return 1.1f; }
-float GetDeltaR()     { return 0.05f; }
-float GetDeltaG()     { return 0.0f;  }
-float GetDeltaB()     { return -0.03f; }
+// Live controls — change these at runtime for instant effect
+static float GetBrightness() { return 1.25f; }
+static float GetGamma()      { return 2.2f;  }
+static float GetContrast()   { return 1.18f; }
+static float GetDeltaR()     { return 0.07f; }
+static float GetDeltaG()     { return 0.0f;  }
+static float GetDeltaB()     { return -0.04f; }
 
-// Fixed and improved overlay loop
-void RunDynamicOverlayDXGI(ID3D11Device* d3dDevice, ID3D11DeviceContext* context, IDXGIOutput1* output1)
+static std::atomic<bool> g_overlayRunning{ true };
+static cudaGraphicsResource* g_cudaResource = nullptr;
+static ID3D11Texture2D* g_stagingTex = nullptr;
+
+static void RunColorOverlay(ID3D11Device* device, ID3D11DeviceContext* context, IDXGIOutput1* output1)
 {
-    if (!d3dDevice || !output1) return;
+    if (!device || !output1) return;
 
     ComPtr<IDXGIOutputDuplication> dupl;
-    HRESULT hr = output1->DuplicateOutput(d3dDevice, &dupl);
-    if (FAILED(hr)) {
-        printf("DuplicateOutput failed: 0x%X\n", hr);
-        return;
-    }
+    if (FAILED(output1->DuplicateOutput(device, &dupl))) return;
 
-    // Get real output description
-    DXGI_OUTPUT_DESC outputDesc;
-    output1->GetDesc(&outputDesc);
-    int width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
-    int height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
+    DXGI_OUTPUT_DESC desc;
+    output1->GetDesc(&desc);
+    int w = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
+    int h = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
 
-    // Create staging texture matching screen size
-    D3D11_TEXTURE2D_DESC texDesc = {};
-    texDesc.Width = width;
-    texDesc.Height = height;
-    texDesc.MipLevels = 1;
-    texDesc.ArraySize = 1;
+    D3D11_TEXTURE2D_DESC texDesc{};
+    texDesc.Width = w; texDesc.Height = h;
+    texDesc.MipLevels = texDesc.ArraySize = 1;
     texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    texDesc.SampleDesc.Count = 1;
+    si::SampleDesc.Count = 1;
     texDesc.Usage = D3D11_USAGE_DEFAULT;
     texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    texDesc.CPUAccessFlags = 0;
 
-    ComPtr<ID3D11Texture2D> stagingTex;
-    hr = d3dDevice->CreateTexture2D(&texDesc, nullptr, &stagingTex);
-    if (FAILED(hr)) return;
-
-    // Register with CUDA - MUST use surface-capable flags for write access
-    cudaGraphicsResource* cudaResource = nullptr;
-    cudaError_t cuErr = cudaGraphicsD3D11RegisterResource(&cudaResource, stagingTex.Get(),
-        cudaGraphicsRegisterFlagsSurfaceLoadStore);
-    if (cuErr != cudaSuccess) {
-        printf("CUDA register failed: %s\n", cudaGetErrorString(cuErr));
-        return;
-    }
+    if (FAILED(device->CreateTexture2D(&texDesc, nullptr, &g_stagingTex))) return;
+    cudaGraphicsD3D11RegisterResource(&g_cudaResource, g_stagingTex, cudaGraphicsRegisterFlagsSurfaceLoadStore);
 
     dim3 threads(16, 16);
-    dim3 blocks((width + 15) / 16, (height + 15) / 16);
+    dim3 blocks((w + 15)/16, (h + 15)/16);
 
-    while (g_Running.load())
+    while (g_overlayRunning.load())
     {
-        DXGI_OUTDUPL_FRAME_INFO frameInfo;
-        ComPtr<IDXGIResource> desktopResource;
+        DXGI_OUTDUPL_FRAME_INFO info;
+        ComPtr<IDXGIResource> res;
+        HRESULT hr = dupl->AcquireNextFrame(100, &info, &res);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) { std::this_thread::yield(); continue; }
+        if (FAILED(hr)) break;
 
-        hr = dupl->AcquireNextFrame(100, &frameInfo, &desktopResource);
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-        if (FAILED(hr)) {
-            if (hr == DXGI_ERROR_ACCESS_LOST) {
-                printf("Access lost - restarting duplication...\n");
-                break; // will recreate on next run
-            }
-            continue;
-        }
-
-        ComPtr<ID3D11Texture2D> acquiredTex;
-        desktopResource->QueryInterface(IID_PPV_ARGS(&acquiredTex));
-        context->CopyResource(stagingTex.Get(), acquiredTex.Get());
+        ComPtr<ID3D11Texture2D> frame;
+        res->QueryInterface(IID_PPV_ARGS(&frame));
+        context->CopyResource(g_stagingTex, frame.Get());
         dupl->ReleaseFrame();
 
-        // Map CUDA resource
-        cudaGraphicsMapResources(1, &cudaResource, 0);
-        cudaArray_t cuArray;
-        cudaGraphicsSubResourceGetMappedArray(&cuArray, cudaResource, 0, 0);
-
-        // Bind to surface for writing (better than pointer mapping for UNORM)
-        cudaSurfaceObject_t surfObj = 0;
-        cudaResourceDesc surfDesc{};
-        surfDesc.resType = cudaResourceTypeArray;
-        surfDesc.res.array.array = cuArray;
-        cudaCreateSurfaceObject(&surfObj, &surfDesc);
-
-        // We'll use surface write instead of pointer (more reliable)
-        // But for simplicity, let's keep your original pointer method with fix:
+        cudaGraphicsMapResources(1, &g_cudaResource, 0);
         Color* devPtr = nullptr;
-        size_t numBytes = 0;
-        cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &numBytes, cudaResource);
+        size_t size = 0;
+        cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &size, g_cudaResource);
 
-        // Launch kernel
         float b = GetBrightness(), g = GetGamma(), c = GetContrast();
         float dr = GetDeltaR(), dg = GetDeltaG(), db = GetDeltaB();
 
-        AdjustKernel<<<blocks, threads>>>(devPtr, width, height, b, g, c, dr, dg, db);
+        AdjustKernel<<<blocks, threads>>>(devPtr, w, h, b, g, c, dr, dg, db);
         cudaDeviceSynchronize();
-
-        cudaDestroySurfaceObject(surfObj);
-        cudaGraphicsUnmapResources(1, &cudaResource, 0);
+        cudaGraphicsUnmapResources(1, &g_cudaResource, 0);
     }
 
-    // Cleanup
-    if (cudaResource) cudaGraphicsUnregisterResource(cudaResource);
+    if (g_cudaResource) cudaGraphicsUnregisterResource(g_cudaResource);
+    if (g_stagingTex) { g_stagingTex->Release(); g_stagingTex = nullptr; }
 }
 
-// Global device pointers
-ComPtr<ID3D11Device> g_D3DDevice;
-ComPtr<ID3D11DeviceContext> g_D3DContext;
-ComPtr<IDXGIOutput1> g_Output1;
-
-// Your AI upscaling model class (placeholder)
-class UpscalingModel {
-public:
-    void save(const std::string&) { printf("Model saved\n"); }
-};
-UpscalingModel upscalingModel;
-
-void* d_inputFrame = nullptr;
-void* d_upscaledFrame = nullptr;
-
-void freeCudaMemory() {
-    if (d_inputFrame) cudaFree(d_inputFrame);
-    if (d_upscaledFrame) cudaFree(d_upscaledFrame);
-    d_inputFrame = d_upscaledFrame = nullptr;
-}
-
-void StopOverlay() {
-    g_Running.store(false);
-}
-
-int main()
+// ——————————————————————————————————————————————
+// MAIN SUPERVISOR LOOP + CLEANUP IN ONE FUNCTION
+// ——————————————————————————————————————————————
+static void RunSupervisor()
 {
-    HRESULT hr = CoInitialize(nullptr);
-    if (FAILED(hr)) return -1;
+    DDAContext ddaCtx;
+    if (!init_dda(ddaCtx)) {
+        printf("Failed to init desktop duplication\n");
+        return;
+    }
 
-    // Create D3D11 device
-    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
-        D3D11_SDK_VERSION, &g_D3DDevice, nullptr, &g_D3DContext);
-    if (FAILED(hr)) return -1;
+    DCompContext dcompCtx;
+    if (!init_dcomp(dcompCtx, TARGET_W_DEFAULT, TARGET_H_DEFAULT)) {
+        printf("Failed to init DirectComposition\n");
+        return;
+    }
 
-    ComPtr<IDXGIDevice> dxgiDevice;
-    g_D3DDevice->QueryInterface(&dxgiDevice);
-    ComPtr<IDXGIAdapter> adapter;
-    dxgiDevice->GetAdapter(&adapter);
-    ComPtr<IDXGIOutput> output;
-    adapter->EnumOutputs(0, &output);
-    output->QueryInterface(&g_Output1);
+    if (cudaInitialized) {
+        allocateCudaMemory(TARGET_W_DEFAULT, TARGET_H_DEFAULT);
+    }
 
-    // Allocate 8K buffers
-    cudaMalloc(&d_inputFrame, 8192 * 4320 * 4);
-    cudaMalloc(&d_upscaledFrame, 7680 * 4320 * 4); // 7680×4320 = 8K
+    upscalingModel.load(std::string(MODULES_DIR) + "/upscaling_model.bin");
 
-    // Start overlay thread
-    std::thread overlayThread([]() {
-        RunDynamicOverlayDXGI(g_D3DDevice.Get(), g_D3DContext.Get(), g_Output1.Get());
-    });
+    // Launch cinematic color overlay in background
+    std::thread overlayThread(RunColorOverlay, ddaCtx.device.Get(), ddaCtx.context.Get(), ddaCtx.output1.Get());
 
-    bool running = true;
-    auto frameStart = std::chrono::high_resolution_clock::now();
-    const auto frameInterval = std::chrono::milliseconds(16); // ~60 FPS
+    std::vector<uint8_t> frame;
+    int w = 0, h = 0;
     int frameCount = 0;
+    bool running = true;
 
-    FrameBuffer prevFrame;
-    std::vector<FrameBuffer> frameHistory;
+    auto lastFrameTime = std::chrono::steady_clock::now();
+    auto frameInterval = std::chrono::milliseconds(1000 / TARGET_HZ);
 
     while (running)
     {
-        auto currentTime = std::chrono::high_resolution_clock::now();
+        auto now = std::chrono::steady_clock::now();
 
-        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-            running = false;
+        bool gotFrame = false;
+        if (ddaCtx.initialized) gotFrame = grab_frame_dda(ddaCtx, frame, w, h);
+        if (!gotFrame) gotFrame = grab_frame_gdi(frame, w, h);
+
+        if (gotFrame)
+        {
+            processFrameWithVerification(frame, w, h);
+
+            frameDataHistory.push_back(frame);
+            if (frameDataHistory.size() > 3) frameDataHistory.erase(frameDataHistory.begin());
+
+            present_via_dcomp(dcompCtx, frame, TARGET_W_DEFAULT, TARGET_H_DEFAULT);
+            frameCount++;
+
+            // Interpolated frames
+            auto interp = generateInterpolatedFrames(TARGET_W_DEFAULT, TARGET_H_DEFAULT);
+            for (const auto& f : interp) {
+                present_via_dcomp(dcompCtx, f, TARGET_W_DEFAULT, TARGET_H_DEFAULT);
+                frameCount++;
+            }
+
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) running = false;
+            if (frameCount % 300 == 0) {
+                upscalingModel.save(std::string(MODULES_DIR) + "/upscaling_model.bin");
+            }
         }
 
-        // Simulate frame processing (replace with real capture + upscaling)
-        FrameBuffer processed;
-        processed.width = 7680;
-        processed.height = 4320;
-        processed.data = d_upscaledFrame; // after upscaling
-
-        // Motion estimation
-        if (prevFrame.data) {
-            estimateMotion(processed, prevFrame);
-        }
-        processed.motionField = /* your motion field */;
-        frameHistory.push_back(std::move(processed));
-        prevFrame = processed;
-
-        frameCount++;
-
-        if (frameCount % 300 == 0) {
-            upscalingModel.save("upscaling_model.bin");
-        }
-
-        std::this_thread::sleep_until(currentTime + frameInterval);
+        sleep_until(lastFrameTime + frameInterval);
+        lastFrameTime = std::chrono::steady_clock::now();
     }
 
-    // Shutdown
-    StopOverlay();
+    // ——————— CLEANUP ———————
+    g_overlayRunning = false;
     if (overlayThread.joinable()) overlayThread.join();
 
-    // Final save
-    upscalingModel.save("upscaling_model.bin");
-
+    upscalingModel.save(std::string(MODULES_DIR) + "/upscaling_model.bin");
     freeCudaMemory();
+    cleanupCuda();
+
+    printf("Supervisor shutdown complete.\n");
+}
+
+// ——————————————————————————————————————————————
+// MAIN — short and beautiful
+// ——————————————————————————————————————————————
+int main()
+{
+    CoInitialize(nullptr);
+    initCuda();
+    ensure_dirs();
+    set_high_priority();
+
+    RunSupervisor();
+
     CoUninitialize();
     return 0;
 }
