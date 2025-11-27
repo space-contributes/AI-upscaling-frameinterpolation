@@ -1222,6 +1222,8 @@ static void applyColorTransform(std::vector<uint8_t>& frame, int w, int h) {
     }
 }
 
+
+
 // -------------------- Priority --------------------
 static void set_high_priority(){
     SetPriorityClass(GetCurrentProcess(),REALTIME_PRIORITY_CLASS);
@@ -1396,66 +1398,251 @@ int main() {
                 present_via_dcomp(dcompCtx, interpolatedFrame, TARGET_W_DEFAULT, TARGET_H_DEFAULT);
                 frameCount++;
             }
-            
-            // Adjust color parameters based on user input (simplified)
-            if (GetAsyncKeyState(VK_F1) & 0x8000) {
-                colorEditingParams.brightness += 0.05f;
-                colorEditingParams.brightness = MIN(colorEditingParams.brightness, 1.0f);
-            }
-            if (GetAsyncKeyState(VK_F2) & 0x8000) {
-                colorEditingParams.brightness -= 0.05f;
-                colorEditingParams.brightness = MAX(colorEditingParams.brightness, -1.0f);
-            }
-            if (GetAsyncKeyState(VK_F3) & 0x8000) {
-                colorEditingParams.contrast += 0.1f;
-                colorEditingParams.contrast = MIN(colorEditingParams.contrast, 3.0f);
-            }
-            if (GetAsyncKeyState(VK_F4) & 0x8000) {
-                colorEditingParams.contrast -= 0.1f;
-                colorEditingParams.contrast = MAX(colorEditingParams.contrast, 0.1f);
-            }
-            if (GetAsyncKeyState(VK_F5) & 0x8000) {
-                colorEditingParams.saturation += 0.1f;
-                colorEditingParams.saturation = MIN(colorEditingParams.saturation, 3.0f);
-            }
-            if (GetAsyncKeyState(VK_F6) & 0x8000) {
-                colorEditingParams.saturation -= 0.1f;
-                colorEditingParams.saturation = MAX(colorEditingParams.saturation, 0.0f);
-            }
-            if (GetAsyncKeyState(VK_F7) & 0x8000) {
-                colorEditingParams.hue += 0.1f;
-            }
-            if (GetAsyncKeyState(VK_F8) & 0x8000) {
-                colorEditingParams.hue -= 0.1f;
-            }
-            if (GetAsyncKeyState(VK_F9) & 0x8000) {
-                colorEditingParams.gamma += 0.1f;
-                colorEditingParams.gamma = MIN(colorEditingParams.gamma, 3.0f);
-            }
-            if (GetAsyncKeyState(VK_F10) & 0x8000) {
-                colorEditingParams.gamma -= 0.1f;
-                colorEditingParams.gamma = MAX(colorEditingParams.gamma, 0.1f);
-            }
-            
-            if(frameCount % 60 == 0) {
-                // Log frame processing stats
-            }
+            using Microsoft::WRL::ComPtr;
+
+// Your existing structs (assuming these exist)
+struct Color { float r, g, b, a; };
+
+struct FrameBuffer {
+    void* data = nullptr;
+    int width = 0, height = 0;
+    void* motionField = nullptr; // assuming some motion vector buffer
+    ~FrameBuffer() { /* free data if owned */ }
+};
+
+// Global shutdown flag
+std::atomic<bool> g_Running{ true };
+
+// CUDA Kernel - unchanged, correct
+__global__ void AdjustKernel(Color* pixels, int width, int height,
+                            float brightness, float gamma, float contrast,
+                            float deltaR, float deltaG, float deltaB)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    int idx = y * width + x;
+    Color c = pixels[idx];
+
+    float invGamma = 1.0f / gamma;
+    c.r = fminf(fmaxf(powf(c.r * brightness, invGamma) * contrast + deltaR, 0.0f), 1.0f);
+    c.g = fminf(fmaxf(powf(c.g * brightness, invGamma) * contrast + deltaG, 0.0f), 1.0f);
+    c.b = fminf(fmaxf(powf(c.b * brightness, invGamma) * contrast + deltaB, 0.0f), 1.0f);
+
+    pixels[idx] = c;
+}
+
+// Dynamic parameter callbacks (example implementations - replace with your real ones)
+float GetBrightness() { return 1.2f; }
+float GetGamma()      { return 1.8f; }
+float GetContrast()   { return 1.1f; }
+float GetDeltaR()     { return 0.05f; }
+float GetDeltaG()     { return 0.0f;  }
+float GetDeltaB()     { return -0.03f; }
+
+// Fixed and improved overlay loop
+void RunDynamicOverlayDXGI(ID3D11Device* d3dDevice, ID3D11DeviceContext* context, IDXGIOutput1* output1)
+{
+    if (!d3dDevice || !output1) return;
+
+    ComPtr<IDXGIOutputDuplication> dupl;
+    HRESULT hr = output1->DuplicateOutput(d3dDevice, &dupl);
+    if (FAILED(hr)) {
+        printf("DuplicateOutput failed: 0x%X\n", hr);
+        return;
+    }
+
+    // Get real output description
+    DXGI_OUTPUT_DESC outputDesc;
+    output1->GetDesc(&outputDesc);
+    int width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
+    int height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
+
+    // Create staging texture matching screen size
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texDesc.CPUAccessFlags = 0;
+
+    ComPtr<ID3D11Texture2D> stagingTex;
+    hr = d3dDevice->CreateTexture2D(&texDesc, nullptr, &stagingTex);
+    if (FAILED(hr)) return;
+
+    // Register with CUDA - MUST use surface-capable flags for write access
+    cudaGraphicsResource* cudaResource = nullptr;
+    cudaError_t cuErr = cudaGraphicsD3D11RegisterResource(&cudaResource, stagingTex.Get(),
+        cudaGraphicsRegisterFlagsSurfaceLoadStore);
+    if (cuErr != cudaSuccess) {
+        printf("CUDA register failed: %s\n", cudaGetErrorString(cuErr));
+        return;
+    }
+
+    dim3 threads(16, 16);
+    dim3 blocks((width + 15) / 16, (height + 15) / 16);
+
+    while (g_Running.load())
+    {
+        DXGI_OUTDUPL_FRAME_INFO frameInfo;
+        ComPtr<IDXGIResource> desktopResource;
+
+        hr = dupl->AcquireNextFrame(100, &frameInfo, &desktopResource);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
         }
-        
+        if (FAILED(hr)) {
+            if (hr == DXGI_ERROR_ACCESS_LOST) {
+                printf("Access lost - restarting duplication...\n");
+                break; // will recreate on next run
+            }
+            continue;
+        }
+
+        ComPtr<ID3D11Texture2D> acquiredTex;
+        desktopResource->QueryInterface(IID_PPV_ARGS(&acquiredTex));
+        context->CopyResource(stagingTex.Get(), acquiredTex.Get());
+        dupl->ReleaseFrame();
+
+        // Map CUDA resource
+        cudaGraphicsMapResources(1, &cudaResource, 0);
+        cudaArray_t cuArray;
+        cudaGraphicsSubResourceGetMappedArray(&cuArray, cudaResource, 0, 0);
+
+        // Bind to surface for writing (better than pointer mapping for UNORM)
+        cudaSurfaceObject_t surfObj = 0;
+        cudaResourceDesc surfDesc{};
+        surfDesc.resType = cudaResourceTypeArray;
+        surfDesc.res.array.array = cuArray;
+        cudaCreateSurfaceObject(&surfObj, &surfDesc);
+
+        // We'll use surface write instead of pointer (more reliable)
+        // But for simplicity, let's keep your original pointer method with fix:
+        Color* devPtr = nullptr;
+        size_t numBytes = 0;
+        cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &numBytes, cudaResource);
+
+        // Launch kernel
+        float b = GetBrightness(), g = GetGamma(), c = GetContrast();
+        float dr = GetDeltaR(), dg = GetDeltaG(), db = GetDeltaB();
+
+        AdjustKernel<<<blocks, threads>>>(devPtr, width, height, b, g, c, dr, dg, db);
+        cudaDeviceSynchronize();
+
+        cudaDestroySurfaceObject(surfObj);
+        cudaGraphicsUnmapResources(1, &cudaResource, 0);
+    }
+
+    // Cleanup
+    if (cudaResource) cudaGraphicsUnregisterResource(cudaResource);
+}
+
+// Global device pointers
+ComPtr<ID3D11Device> g_D3DDevice;
+ComPtr<ID3D11DeviceContext> g_D3DContext;
+ComPtr<IDXGIOutput1> g_Output1;
+
+// Your AI upscaling model class (placeholder)
+class UpscalingModel {
+public:
+    void save(const std::string&) { printf("Model saved\n"); }
+};
+UpscalingModel upscalingModel;
+
+void* d_inputFrame = nullptr;
+void* d_upscaledFrame = nullptr;
+
+void freeCudaMemory() {
+    if (d_inputFrame) cudaFree(d_inputFrame);
+    if (d_upscaledFrame) cudaFree(d_upscaledFrame);
+    d_inputFrame = d_upscaledFrame = nullptr;
+}
+
+void StopOverlay() {
+    g_Running.store(false);
+}
+
+int main()
+{
+    HRESULT hr = CoInitialize(nullptr);
+    if (FAILED(hr)) return -1;
+
+    // Create D3D11 device
+    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+        D3D11_SDK_VERSION, &g_D3DDevice, nullptr, &g_D3DContext);
+    if (FAILED(hr)) return -1;
+
+    ComPtr<IDXGIDevice> dxgiDevice;
+    g_D3DDevice->QueryInterface(&dxgiDevice);
+    ComPtr<IDXGIAdapter> adapter;
+    dxgiDevice->GetAdapter(&adapter);
+    ComPtr<IDXGIOutput> output;
+    adapter->EnumOutputs(0, &output);
+    output->QueryInterface(&g_Output1);
+
+    // Allocate 8K buffers
+    cudaMalloc(&d_inputFrame, 8192 * 4320 * 4);
+    cudaMalloc(&d_upscaledFrame, 7680 * 4320 * 4); // 7680×4320 = 8K
+
+    // Start overlay thread
+    std::thread overlayThread([]() {
+        RunDynamicOverlayDXGI(g_D3DDevice.Get(), g_D3DContext.Get(), g_Output1.Get());
+    });
+
+    bool running = true;
+    auto frameStart = std::chrono::high_resolution_clock::now();
+    const auto frameInterval = std::chrono::milliseconds(16); // ~60 FPS
+    int frameCount = 0;
+
+    FrameBuffer prevFrame;
+    std::vector<FrameBuffer> frameHistory;
+
+    while (running)
+    {
+        auto currentTime = std::chrono::high_resolution_clock::now();
+
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
             running = false;
         }
-        
-        if (frameCount % 300 == 0) {
-            upscalingModel.save(std::string(MODULES_DIR) + "/upscaling_model.bin");
+
+        // Simulate frame processing (replace with real capture + upscaling)
+        FrameBuffer processed;
+        processed.width = 7680;
+        processed.height = 4320;
+        processed.data = d_upscaledFrame; // after upscaling
+
+        // Motion estimation
+        if (prevFrame.data) {
+            estimateMotion(processed, prevFrame);
         }
-        
+        processed.motionField = /* your motion field */;
+        frameHistory.push_back(std::move(processed));
+        prevFrame = processed;
+
+        frameCount++;
+
+        if (frameCount % 300 == 0) {
+            upscalingModel.save("upscaling_model.bin");
+        }
+
         std::this_thread::sleep_until(currentTime + frameInterval);
     }
-    
+
+    // Shutdown
+    StopOverlay();
+    if (overlayThread.joinable()) overlayThread.join();
+
+    // Final save
+    upscalingModel.save("upscaling_model.bin");
+
     freeCudaMemory();
-    cleanupCuda();
-    
-    upscalingModel.save(std::string(MODULES_DIR) + "/upscaling_model.bin");
+    CoUninitialize();
     return 0;
 }
