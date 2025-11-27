@@ -1,9 +1,13 @@
 // supervisor_kernels.cu
+
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cmath>
 #include <cfloat>  // FLT_MAX
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/vector_types.h"
+#pragma comment(lib, "libucrt.lib")
+#pragma comment(lib, "libvcruntime.lib") 
+#pragma comment(lib, "libcmt.lib")
 
 // Custom min/max functions to avoid conflicts with CUDA
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
@@ -94,7 +98,6 @@ __global__ void upscalingKernel(
     float w, float x, float y, float z, float eta,
     float chromaStretch, float hueWarp, float lightnessFlow)
 {
-    // Fixed variable names to avoid conflicts with function parameters
     int px = blockIdx.x * blockDim.x + threadIdx.x;
     int py = blockIdx.y * blockDim.y + threadIdx.y;
     
@@ -204,7 +207,7 @@ __global__ void upscalingKernel(
 }
 
 // Color adjustment kernel
-extern "C" __global__ void AdjustKernel(Color* pixels, int width, int height,
+__global__ void AdjustKernel(Color* pixels, int width, int height,
                             float brightness, float gamma, float contrast,
                             float deltaR, float deltaG, float deltaB)
 {
@@ -221,4 +224,48 @@ extern "C" __global__ void AdjustKernel(Color* pixels, int width, int height,
     c.b = fminf(fmaxf(powf(c.b * brightness, invGamma) * contrast + deltaB, 0.0f), 1.0f);
 
     pixels[idx] = c;
+}
+
+
+// =================================================================
+// == CRITICAL ADDITION: HOST-SIDE WRAPPER FUNCTIONS ==
+// =================================================================
+// These functions are callable from C++ (.cpp) and will launch the
+// __global__ kernels defined above.
+extern "C" {
+    void launchMotionEstimationKernel(
+        const unsigned char* currentFrame,
+        const unsigned char* previousFrame,
+        int width, int height,
+        MotionVector* motionField,
+        int blockSize, int maxMotionVector)
+    {
+        dim3 gridDim((width + blockSize - 1) / blockSize, (height + blockSize - 1) / blockSize);
+        dim3 blockDim(1); // Each thread calculates one motion vector
+        motionEstimationKernel<<<gridDim, blockDim>>>(currentFrame, previousFrame, width, height, motionField, blockSize, maxMotionVector);
+    }
+    
+    void launchUpscalingKernel(
+        const unsigned char* input,
+        unsigned char* output,
+        int inW, int inH, int outW, int outH,
+        float scaleX, float scaleY,
+        float sharpnessFactor,
+        float brightness, float contrast, float saturation, float hue, float gamma,
+        float w, float x, float y, float z, float eta,
+        float chromaStretch, float hueWarp, float lightnessFlow)
+    {
+        dim3 gridDim((outW + 15) / 16, (outH + 15) / 16);
+        dim3 blockDim(16, 16);
+        upscalingKernel<<<gridDim, blockDim>>>(input, output, inW, inH, outW, outH, scaleX, scaleY, sharpnessFactor, brightness, contrast, saturation, hue, gamma, w, x, y, z, eta, chromaStretch, hueWarp, lightnessFlow);
+    }
+    
+    void launchAdjustKernel(Color* pixels, int width, int height,
+        float brightness, float gamma, float contrast,
+        float deltaR, float deltaG, float deltaB)
+    {
+        dim3 gridDim((width + 15) / 16, (height + 15) / 16);
+        dim3 blockDim(16, 16);
+        AdjustKernel<<<gridDim, blockDim>>>(pixels, width, height, brightness, gamma, contrast, deltaR, deltaG, deltaB);
+    }
 }
