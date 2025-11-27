@@ -4,6 +4,7 @@
 #### Windows 10/11 - NVIDIA GPU Required (CUDA 13.0+) - Real-time Desktop Upscaling and Colour enhancement
 ### ***SuperRes Supervisor*** is a next-generation GPU-accelerated display enhancement engine that delivers live 8K upscaling, CUDA-powered motion estimation, AI-adaptive frame interpolation, DirectComposition overlay rendering, and dynamic infinite-color gamut adaptation tuned to trick the human visual system for perceptually richer, more vivid colors, all with sub-millisecond latency, multi-threaded processing, and self-learning quality optimization — optimized at the CUDA kernel level for cinematic clarity.
 No external dependencies beyond NVIDIA drivers!
+#### HDR10+ 
 ##### No external dependencies beyond NVIDIA drivers!
 *Made with ❤️ by Space-code* WITH *CUTTING-EDGE CUDA ACCELERATION*!
 
@@ -297,7 +298,6 @@ If you have CUDA 12.x or 14.x:
 ### Version 1.1 (Q2 2025)
 - [ ] Real-time UI with quality controls
 - [ ] Per-application profiles
-- [ ] HDR support
 - [ ] Multi-monitor support
 - [ ] Configurable hotkeys
 
@@ -380,5 +380,6 @@ Transform your display. Unlock hidden detail. Experience true visual clarity.
   - All elements can be a tagline and may not represent its true nature
   - All elements may harm or help in making your computer better as governed by the System Requirments!
 *** - Combination of all legal markers + not officially endorsed as newer updates may have critical security patches! Applies to all content.
+     20th Century Fox, Panasonic, and Samsung have created the original HDR10+ - All references for educational and research purposes only and this service is provided on a "as-is" basis with no obligaations and regarding the same is the "as-is" basis enforced without malice and with intent regarding to educational and research purposes only and to make the display industry better for all and HDR10+ Support is subject to licensing. Only for purposes for compatibility for all machines.
 
 *© 2025 Space-code. All processing happens locally on your device. Terms and conditions apply - Terms And Conditions: https://github.com/space-contributes/arby-audio_3d/LICENSE.md - All elements subject to change without further notice - Arby Audio is a distinct service but its terms and conditions may apply to SuperRes Supervisor! For only educational and research (with fun!) purposes! Terms and Conditions Apply!*
