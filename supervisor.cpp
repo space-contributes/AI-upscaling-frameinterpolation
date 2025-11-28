@@ -1,1551 +1,590 @@
-// supervisor.cpp
-// Enhanced SuperRes Supervisor with CUDA-accelerated Motion Estimation & AI Upscaling
-// Added HDR10+ metadata, real-time color editing, DirectComposition rendering, memory safety, and multiple interpolations
-
-#include <initguid.h>
-#include <dxgi1_2.h>
-#include <d3d11.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <thread>
+#include <memory>
+#include <algorithm>
+#include <immintrin.h>
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <dcomp.h>
-#include <d3d11_1.h>
-#include <gdiplus.h>
-#include <winhttp.h>
-#include <chrono>
-#include <thread>
-#include <iostream>
-#include <fstream>
-#include <vector>
-#include <algorithm>
-#include <mutex>
-#include <atomic>
-#include <cmath>
-#include <iomanip>
-#include <string>
-#include <cfloat>
-#include <memory>
-#include <unordered_map>
-#include <queue>
-#include <condition_variable>
-#include <comdef.h>
-#include <dwmapi.h>
-#include <shellscalingapi.h>
-
-// CUDA headers with full paths
-#include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/cuda_runtime.h"
-#include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/cuda_d3d11_interop.h"
-#include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/device_launch_parameters.h"
-#include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/vector_types.h"
-
-// Custom min/max functions to avoid conflicts with CUDA
-#define MIN(a,b) ((a) < (b) ? (a) : (b))
-#define MAX(a,b) ((a) > (b) ? (a) : (b))
-#define CLAMP(val, min_val, max_val) ((val) < (min_val) ? (min_val) : ((val) > (max_val) ? (max_val) : (val)))
-
-// Struct definitions
-struct Color { 
-    float r, g, b, a; 
-};
-
-struct MotionVector {
-    int x, y;
-    float confidence;
-};
-
-// Host-side wrapper function declarations
-extern "C" {
-    void launchMotionEstimationKernel(
-        const unsigned char* currentFrame,
-        const unsigned char* previousFrame,
-        int width, int height,
-        MotionVector* motionField,
-        int blockSize, int maxMotionVector);
-        
-    void launchUpscalingKernel(
-        const unsigned char* input,
-        unsigned char* output,
-        int inW, int inH, int outW, int outH,
-        float scaleX, float scaleY,
-        float sharpnessFactor,
-        float brightness, float contrast, float saturation, float hue, float gamma,
-        float w, float x, float y, float z, float eta,
-        float chromaStretch, float hueWarp, float lightnessFlow);
-        
-    void launchAdjustKernel(Color* pixels, int width, int height,
-        float brightness, float gamma, float contrast,
-        float deltaR, float deltaG, float deltaB);
-}
-
-// HDR10+ Metadata structure
-struct HDR10PlusMetadata {
-    std::vector<uint8_t> data;
-    bool isAvailable;
-    
-    HDR10PlusMetadata() : isAvailable(false) {}
-    
-    void parse(const std::vector<uint8_t>& metadata) {
-        if (metadata.empty()) {
-            isAvailable = false;
-            return;
-        }
-        
-        // Simple parsing for demonstration
-        data = metadata;
-        isAvailable = true;
-    }
-};
-
-// Color space transformation parameters
-struct ColorTransformParams {
-    float w, x, y, z;  // Weights for different color spaces
-    float eta;         // Offset
-    float chromaStretch;
-    float hueWarp;
-    float lightnessFlow;
-    
-    ColorTransformParams() : w(0.5f), x(0.2f), y(0.2f), z(0.1f), eta(0.0f), 
-                           chromaStretch(1.0f), hueWarp(0.0f), lightnessFlow(0.0f) {}
-};
-
-// Real-time color editing parameters
-struct ColorEditingParams {
-    float brightness;
-    float contrast;
-    float saturation;
-    float hue;
-    float gamma;
-    
-    ColorEditingParams() : brightness(0.0f), contrast(1.0f), saturation(1.0f), 
-                          hue(0.0f), gamma(1.0f) {}
-};
-
-// GDIColorMetrics structure
-struct GDIColorMetrics {
-    float gammaR, gammaG, gammaB;        // Per-channel gamma approximation
-    float brightness;                    // Brightness derived from ramp centroid
-    float contrast;                      // Contrast derived from ramp slope
-    float deltaR, deltaG, deltaB;        // White point deviations
-    WORD  ramp[3][256];                  // Raw LUT
-};
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dcomp.lib")
-#pragma comment(lib, "user32.lib")
-#pragma comment(lib, "gdi32.lib")
-#pragma comment(lib, "winmm.lib")
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "cudart.lib")
-#pragma comment(lib, "dwmapi.lib")
-#pragma comment(lib, "shcore.lib")
 
-// -------------------- Configuration --------------------
-static const int TARGET_HZ = 9000000;
-static const int TARGET_W_DEFAULT = 7680;
-static const int TARGET_H_DEFAULT = 4320;
-static const double ARTIFACT_DETECT_THRESHOLD = 0.001;
-static const char* KERNELS_PTX_LOCAL = "modules/cleanup.ptx";
-static const char* LOG_PATH = "logs/boot.log";
-static const char* MODULES_DIR = "modules";
-static const char* LOGS_DIR = "logs";
-static const int ONLINE_ADAPTIVE_WINDOW = 8;
-static const int MOTION_BLOCK_SIZE = 16;
-static const int MAX_MOTION_VECTOR = 32;
-static const int MAX_INTERPOLATIONS_PER_FRAME = 3;  // New parameter for multiple interpolations
+// ============================================================================
+// VECTOR MATH & SIMD UTILITIES
+// ============================================================================
 
-// Global parameters for color transformation and editing
-static ColorTransformParams colorTransformParams;
-static ColorEditingParams colorEditingParams;
-static HDR10PlusMetadata hdrMetadata;
+struct Vec3 {
+    float x, y, z;
+    Vec3(float x = 0, float y = 0, float z = 0) : x(x), y(y), z(z) {}
+    Vec3 operator+(const Vec3& v) const { return Vec3(x+v.x, y+v.y, z+v.z); }
+    Vec3 operator-(const Vec3& v) const { return Vec3(x-v.x, y-v.y, z-v.z); }
+    Vec3 operator*(float s) const { return Vec3(x*s, y*s, z*s); }
+    float dot(const Vec3& v) const { return x*v.x + y*v.y + z*v.z; }
+    float length() const { return std::sqrt(x*x + y*y + z*z); }
+};
 
-// Frame data history
-static std::vector<std::vector<uint8_t>> frameDataHistory;
+struct Mat3x3 {
+    float m[9];
+    Vec3 mul(const Vec3& v) const {
+        return Vec3(
+            m[0]*v.x + m[1]*v.y + m[2]*v.z,
+            m[3]*v.x + m[4]*v.y + m[5]*v.z,
+            m[6]*v.x + m[7]*v.y + m[8]*v.z
+        );
+    }
+};
 
-// -------------------- RAII Wrappers for DirectX Resources --------------------
-template<typename T>
-class ComPtr {
+// ============================================================================
+// COLOR SPACE TRANSFORMATIONS
+// (left exactly as you wrote it — no changes)
+// ============================================================================
+
+class ColorSpaceEngine {
 private:
-    T* ptr;
+    // Dynamic transformation matrices (learned)
+    Mat3x3 P3_to_XYZ, Adobe_to_XYZ, ProPhoto_to_XYZ, BT2020_to_XYZ;
+    Mat3x3 XYZ_to_CAM02, CAM02_to_JzAzBz;
+    
+    // Adaptive parameters
+    float chroma_stretch, hue_warp, lightness_flow;
+    float contrast_gain, brightness_offset, gamma_exp;
     
 public:
-    ComPtr() : ptr(nullptr) {}
-    ComPtr(T* p) : ptr(p) {}
-    ~ComPtr() { if (ptr) ptr->Release(); }
-    
-    ComPtr(const ComPtr&) = delete;
-    ComPtr& operator=(const ComPtr&) = delete;
-    
-    ComPtr(ComPtr&& other) noexcept : ptr(other.ptr) {
-        other.ptr = nullptr;
+    ColorSpaceEngine() {
+        // Initialize transformation matrices (accurate primaries)
+        P3_to_XYZ = {0.4865f, 0.2657f, 0.1982f,
+                     0.2290f, 0.6917f, 0.0793f,
+                     0.0000f, 0.0451f, 1.0439f};
+       
+        Adobe_to_XYZ = {0.5767f, 0.1856f, 0.1882f,
+                        0.2973f, 0.6274f, 0.0753f,
+                        0.0270f, 0.0707f, 0.9911f};
+       
+        ProPhoto_to_XYZ = {0.7977f, 0.1352f, 0.0313f,
+                           0.2880f, 0.7119f, 0.0001f,
+                           0.0000f, 0.0000f, 0.8249f};
+       
+        BT2020_to_XYZ = {0.6370f, 0.1446f, 0.1689f,
+                         0.2627f, 0.6780f, 0.0593f,
+                         0.0000f, 0.0281f, 1.0610f};
+       
+        // Initialize adaptive parameters
+        chroma_stretch = 1.0f;
+        hue_warp = 0.0f;
+        lightness_flow = 1.0f;
+        contrast_gain = 1.0f;
+        brightness_offset = 0.0f;
+        gamma_exp = 1.0f;
     }
     
-    ComPtr& operator=(ComPtr&& other) noexcept {
-        if (this != &other) {
-            if (ptr) ptr->Release();
-            ptr = other.ptr;
-            other.ptr = nullptr;
-        }
-        return *this;
+    // Linearize sRGB/Display P3
+    float linearize(float v) const {
+        return (v <= 0.04045f) ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
     }
     
-    T* Get() const { return ptr; }
-    T** GetAddressOf() { if (ptr) { ptr->Release(); ptr = nullptr; } return &ptr; }
-    T* operator->() const { return ptr; }
-    operator bool() const { return ptr != nullptr; }
+    // Wide gamut infinite precision blend
+    Vec3 blendGamuts(const Vec3& rgb, float w, float x, float y, float z, float eta) const {
+        Vec3 p3 = P3_to_XYZ.mul(rgb * w);
+        Vec3 adobe = Adobe_to_XYZ.mul(rgb * x);
+        Vec3 prophoto = ProPhoto_to_XYZ.mul(rgb * y);
+        Vec3 bt2020 = BT2020_to_XYZ.mul(rgb * z);
+       
+        Vec3 blended = p3 + adobe + prophoto + bt2020;
+        blended.x += eta; blended.y += eta; blended.z += eta;
+        return blended;
+    }
     
-    void Release() {
-        if (ptr) {
-            ptr->Release();
-            ptr = nullptr;
-        }
+    // XYZ to CAM02-UCS (perceptually uniform)
+    Vec3 XYZ_to_CAM02UCS(const Vec3& xyz) const {
+        // Simplified CAM02-UCS transformation
+        float L = 116.0f * std::cbrt(xyz.y) - 16.0f;
+        float a = 500.0f * (std::cbrt(xyz.x / 0.95047f) - std::cbrt(xyz.y));
+        float b = 200.0f * (std::cbrt(xyz.y) - std::cbrt(xyz.z / 1.08883f));
+        return Vec3(L, a, b);
+    }
+    
+    // CAM02-UCS to Jzazbz (HDR perceptual)
+    Vec3 CAM02_to_Jzazbz(const Vec3& cam) const {
+        float Jz = cam.x / 100.0f;
+        float az = cam.y * chroma_stretch * std::cos(hue_warp);
+        float bz = cam.z * chroma_stretch * std::sin(hue_warp);
+        return Vec3(Jz * lightness_flow, az, bz);
+    }
+    
+    // Full forward pipeline with metadata adaptation
+    Vec3 processPixel(const Vec3& rgb_in, float deltaE_CAM, float deltaE_Jz) {
+        // Stage 1: Linearize
+        Vec3 linear(linearize(rgb_in.x), linearize(rgb_in.y), linearize(rgb_in.z));
+       
+        // Stage 2: Infinite precision gamut blend (dynamic weights)
+        float w = 0.4f + deltaE_CAM * 0.1f;
+        float x = 0.2f + deltaE_Jz * 0.05f;
+        float y = 0.2f;
+        float z = 0.2f;
+        float eta = deltaE_CAM * 0.01f;
+       
+        Vec3 xyz = blendGamuts(linear, w, x, y, z, eta);
+       
+        // Stage 3: Perceptual transformations
+        Vec3 cam02 = XYZ_to_CAM02UCS(xyz);
+        Vec3 jzazbz = CAM02_to_Jzazbz(cam02);
+       
+        // Stage 4: Adaptive enhancement
+        float J = jzazbz.x * contrast_gain + brightness_offset;
+        J = std::pow(std::max(0.0f, J), gamma_exp);
+       
+        // Stage 5: Back to display (simplified)
+        return Vec3(
+            std::clamp(J + jzazbz.y * 0.5f, 0.0f, 1.0f),
+            std::clamp(J, 0.0f, 1.0f),
+            std::clamp(J + jzazbz.z * 0.5f, 0.0f, 1.0f)
+        );
+    }
+    
+    // Learn from frame sequence
+    void adaptFromMotion(float motion_magnitude, float detail_variance) {
+        // Increase chroma stretch for high motion
+        chroma_stretch = 1.0f + motion_magnitude * 0.3f;
+       
+        // Adjust contrast based on detail
+        contrast_gain = 1.0f + detail_variance * 0.5f;
+       
+        // Dynamic gamma for perceived brightness
+        gamma_exp = 0.9f + (1.0f - motion_magnitude) * 0.2f;
+       
+        // Brightness compensation
+        brightness_offset = -0.05f + motion_magnitude * 0.1f;
+       
+        // Hue stability
+        hue_warp = detail_variance * 0.1f;
+        lightness_flow = 1.0f + motion_magnitude * 0.15f;
     }
 };
 
-// -------------------- CUDA Device Management --------------------
-static bool cudaInitialized = false;
-static int cudaDeviceCount = 0;
-static int cudaDevice = 0;
-static cudaStream_t cudaStream;
+// ============================================================================
+// MOTION ESTIMATION & LEARNING
+// ============================================================================
 
-// Initialize CUDA
-static bool initCuda() {
-    cudaError_t result = cudaGetDeviceCount(&cudaDeviceCount);
-    if (result != cudaSuccess || cudaDeviceCount == 0) {
-        return false;
+struct MotionVector {
+    float dx, dy, confidence;
+    MotionVector(float dx = 0, float dy = 0, float c = 0) : dx(dx), dy(dy), confidence(c) {}
+};
+
+class AdaptiveMotionEstimator {
+private:
+    int width, height, block_size;
+    std::vector<MotionVector> motion_field;
+    std::vector<float> motion_history; // Learning buffer
+    
+    float sad(const std::vector<float>& frame1, const std::vector<float>& frame2,
+              int x1, int y1, int x2, int y2, int channel) {
+        float sum = 0;
+        for (int dy = 0; dy < block_size; ++dy) {
+            for (int dx = 0; dx < block_size; ++dx) {
+                int idx1 = ((y1 + dy) * width + (x1 + dx)) * 3 + channel;
+                int idx2 = ((y2 + dy) * width + (x2 + dx)) * 3 + channel;
+                if (idx1 >= 0 && idx1 < (int)frame1.size() && idx2 >= 0 && idx2 < (int)frame2.size()) {
+                    sum += std::abs(frame1[idx1] - frame2[idx2]);
+                }
+            }
+        }
+        return sum;
     }
     
-    result = cudaSetDevice(0);
-    if (result != cudaSuccess) {
-        return false;
+public:
+    AdaptiveMotionEstimator(int w, int h, int bs = 8)
+        : width(w), height(h), block_size(bs) {
+        motion_field.resize((w / bs) * (h / bs));
     }
     
-    result = cudaStreamCreate(&cudaStream);
-    if (result != cudaSuccess) {
-        return false;
+    void estimate(const std::vector<float>& frame1, const std::vector<float>& frame2, int search_range = 16) {
+        int blocks_x = width / block_size;
+        int blocks_y = height / block_size;
+        
+        // Parallel motion estimation
+        #pragma omp parallel for collapse(2)
+        for (int by = 0; by < blocks_y; ++by) {
+            for (int bx = 0; bx < blocks_x; ++bx) {
+                int base_x = bx * block_size;
+                int base_y = by * block_size;
+                
+                float best_sad = 1e9f;
+                int best_dx = 0, best_dy = 0;
+                
+                // Adaptive search range based on history
+                int adaptive_range = search_range;
+                if (!motion_history.empty()) {
+                    float avg_motion = motion_history.back();
+                    adaptive_range = static_cast<int>(search_range * (1.0f + avg_motion * 0.5f));
+                }
+                
+                // Diamond search pattern (efficient)
+                for (int dy = -adaptive_range; dy <= adaptive_range; dy += 2) {
+                    for (int dx = -adaptive_range; dx <= adaptive_range; dx += 2) {
+                        int test_x = base_x + dx;
+                        int test_y = base_y + dy;
+                        
+                        if (test_x >= 0 && test_x + block_size < width &&
+                            test_y >= 0 && test_y + block_size < height) {
+                            
+                            float total_sad = 0;
+                            for (int c = 0; c < 3; ++c) {
+                                total_sad += sad(frame1, frame2, base_x, base_y, test_x, test_y, c);
+                            }
+                            
+                            if (total_sad < best_sad) {
+                                best_sad = total_sad;
+                                best_dx = dx;
+                                best_dy = dy;
+                            }
+                        }
+                    }
+                }
+                
+                float confidence = 1.0f / (1.0f + best_sad / (block_size * block_size * 3.0f));
+                motion_field[by * blocks_x + bx] = MotionVector((float)best_dx, (float)best_dy, confidence);
+            }
+        }
+        
+        // Learn motion patterns
+        float avg_magnitude = 0;
+        for (const auto& mv : motion_field) {
+            avg_magnitude += std::sqrt(mv.dx * mv.dx + mv.dy * mv.dy);
+        }
+        avg_magnitude /= (motion_field.empty() ? 1.0f : (float)motion_field.size());
+        motion_history.push_back(avg_magnitude);
+        if (motion_history.size() > 30) motion_history.erase(motion_history.begin());
     }
     
-    cudaInitialized = true;
-    return true;
-}
-
-// Cleanup CUDA resources
-static void cleanupCuda() {
-    if (cudaInitialized) {
-        cudaStreamDestroy(cudaStream);
-        cudaDeviceReset();
+    MotionVector getMotion(int x, int y) const {
+        int bx = x / block_size;
+        int by = y / block_size;
+        int blocks_x = width / block_size;
+        if (bx >= 0 && bx < blocks_x && by >= 0 && by < (height / block_size)) {
+            return motion_field[by * blocks_x + bx];
+        }
+        return MotionVector(0, 0, 0);
     }
-}
-
-// -------------------- Logging / dirs --------------------
-static void ensure_dirs() {
-    // Using CreateDirectory instead of filesystem for compatibility
-    if (!CreateDirectoryA(MODULES_DIR, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        // Handle error
+    
+    float getMotionMagnitude() const {
+        return motion_history.empty() ? 0.0f : motion_history.back();
     }
-    if (!CreateDirectoryA(LOGS_DIR, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        // Handle error
-    }
-}
+};
 
-// -------------------- Motion Estimation System --------------------
-struct FrameBuffer {
-    std::vector<uint8_t> data;
+// ============================================================================
+// FRAME INTERPOLATION ENGINE (MERGED & FIXED)
+// - public width/height
+// - public mutable motion_estimator & color_engine
+// - sharpen uses both frames + t (no dependency on external 'result' buffer)
+// - interpolate uses existing global Vec3 and MotionVector types
+// ============================================================================
+
+class FrameInterpolator {
+public:
     int width, height;
-    std::vector<MotionVector> motionField;
-    
-    FrameBuffer() : width(0), height(0) {}
-    
-    void resize(int w, int h) {
-        width = w;
-        height = h;
-        data.resize(w * h * 4);
-        motionField.resize((w / MOTION_BLOCK_SIZE) * (h / MOTION_BLOCK_SIZE));
+    mutable AdaptiveMotionEstimator motion_estimator;
+    mutable ColorSpaceEngine color_engine;
+
+    FrameInterpolator(int w, int h)
+        : width(w), height(h), motion_estimator(w, h, 8) {}
+
+    // Bilateral-style adaptive sharpen that blends neighbors from both frames
+    Vec3 sharpen(const std::vector<float>& f1, const std::vector<float>& f2,
+                 const Vec3& c, int x, int y, float strength, float t) const {
+        Vec3 blur(0.0f, 0.0f, 0.0f);
+        float wsum = 0.0f;
+
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                int nx = std::clamp(x + dx, 0, width - 1);
+                int ny = std::clamp(y + dy, 0, height - 1);
+                int idx = (ny * width + nx) * 3;
+
+                Vec3 p1(f1[idx + 0], f1[idx + 1], f1[idx + 2]);
+                Vec3 p2(f2[idx + 0], f2[idx + 1], f2[idx + 2]);
+                Vec3 n = p1 * (1.0f - t) + p2 * t;
+
+                float d = (c - n).length();
+                float spatial = std::hypot((float)dx, (float)dy);
+                float w = std::exp(-(spatial*spatial)/2.0f - (d*d)/0.02f);
+
+                blur = blur + n * w;
+                wsum += w;
+            }
+        }
+
+        if (wsum > 0.0f) {
+            blur = blur * (1.0f / wsum);
+        }
+
+        Vec3 detail = c - blur;
+        return c + detail * strength;
+    }
+
+    // Bilinear sample helper
+    Vec3 sampleBilinear(const std::vector<float>& f, float fx, float fy) const {
+        int x0 = std::clamp(static_cast<int>(fx), 0, width - 1);
+        int y0 = std::clamp(static_cast<int>(fy), 0, height - 1);
+        int x1 = std::min(x0 + 1, width - 1);
+        int y1 = std::min(y0 + 1, height - 1);
+
+        float wx = fx - x0;
+        float wy = fy - y0;
+
+        int i00 = (y0 * width + x0) * 3;
+        int i10 = (y0 * width + x1) * 3;
+        int i01 = (y1 * width + x0) * 3;
+        int i11 = (y1 * width + x1) * 3;
+
+        Vec3 a(f[i00 + 0], f[i00 + 1], f[i00 + 2]);
+        Vec3 b(f[i10 + 0], f[i10 + 1], f[i10 + 2]);
+        Vec3 c(f[i01 + 0], f[i01 + 1], f[i01 + 2]);
+        Vec3 d(f[i11 + 0], f[i11 + 1], f[i11 + 2]);
+
+        Vec3 top = a * (1.0f - wx) + b * wx;
+        Vec3 bot = c * (1.0f - wx) + d * wx;
+        return top * (1.0f - wy) + bot * wy;
+    }
+
+    // Interpolate between two frames with motion compensation, sharpening, and color enhancement.
+    std::vector<float> interpolate(const std::vector<float>& frame1,
+                                   const std::vector<float>& frame2,
+                                   float t) const {
+        // estimate motion (mutable member allowed in const method)
+        motion_estimator.estimate(frame1, frame2);
+
+        float mag = motion_estimator.getMotionMagnitude();
+        color_engine.adaptFromMotion(mag, 0.1f);
+
+        std::vector<float> out(width * height * 3);
+
+        #pragma omp parallel for collapse(2)
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                MotionVector mv = motion_estimator.getMotion(x, y);
+
+                Vec3 s1 = sampleBilinear(frame1, x - mv.dx * t, y - mv.dy * t);
+                Vec3 s2 = sampleBilinear(frame2, x + mv.dx * (1.0f - t), y + mv.dy * (1.0f - t));
+
+                float conf = mv.confidence;
+                // Blend with confidence and temporal weight
+                Vec3 blended = s1 * ((1.0f - t) * conf) + s2 * (t * conf);
+                float denom = ( (1.0f - t) * conf + t * conf );
+                if (denom > 0.0f) blended = blended * (1.0f / denom);
+
+                // Adaptive sharpen using both frames
+                float sharp_strength = 1.8f * (1.0f - mag * 0.4f);
+                Vec3 sharp = sharpen(frame1, frame2, blended, x, y, sharp_strength, t);
+
+                // Color pipeline (unchanged)
+                float deltaE_CAM = (s1 - s2).length();
+                float deltaE_Jz = deltaE_CAM * 0.8f;
+                Vec3 final = color_engine.processPixel(sharp, deltaE_CAM, deltaE_Jz);
+
+                int i = (y * width + x) * 3;
+                out[i + 0] = std::clamp(final.x, 0.f, 1.f);
+                out[i + 1] = std::clamp(final.y, 0.f, 1.f);
+                out[i + 2] = std::clamp(final.z, 0.f, 1.f);
+            }
+        }
+
+        return out;
+    }
+
+    // Keep previous enhanceFrame behavior (for demo/main compatibility)
+    void enhanceFrame(std::vector<float>& frame) const {
+        float detail_var = 0.1f;
+        float motion_mag = motion_estimator.getMotionMagnitude();
+        color_engine.adaptFromMotion(motion_mag, detail_var);
+
+        #pragma omp parallel for
+        for (int i = 0; i < (int)frame.size(); i += 3) {
+            Vec3 pixel(frame[i], frame[i+1], frame[i+2]);
+            Vec3 enhanced = color_engine.processPixel(pixel, 0.05f, 0.03f);
+            frame[i] = enhanced.x;
+            frame[i+1] = enhanced.y;
+            frame[i+2] = enhanced.z;
+        }
     }
 };
 
-static FrameBuffer prevFrame, currentFrame, nextFrame;
-static std::vector<FrameBuffer> frameHistory;
+// ============================================================================
+// main()
+// ============================================================================
+int main() {
+    std::cout << "Adaptive Frame Interpolation & Enhancement Engine\n";
+    std::cout << "================================================\n\n";
 
-static unsigned char* d_currentFrame = nullptr;
-static unsigned char* d_previousFrame = nullptr;
-static MotionVector* d_motionField = nullptr;
-static unsigned char* d_upscaledFrame = nullptr;
+    int width  = GetSystemMetrics(SM_CXSCREEN);
+    int height = GetSystemMetrics(SM_CYSCREEN);
+    std::cout << "Capture Resolution: " << width << "x" << height << "\n";
+    std::cout << "Color Pipeline: P3+Adobe+ProPhoto+BT2020 -> XYZ -> CAM02-UCS -> Jzazbz\n";
+    std::cout << "Features: Motion learning, adaptive sharpening, dynamic color grading\n\n";
 
-static bool allocateCudaMemory(int width, int height) {
-    if (!cudaInitialized) return false;
-    
-    size_t frameSize = width * height * 4 * sizeof(unsigned char);
-    size_t motionFieldSize = (width / MOTION_BLOCK_SIZE) * (height / MOTION_BLOCK_SIZE) * sizeof(MotionVector);
-    
-    cudaError_t result;
-    
-    result = cudaMalloc(&d_currentFrame, frameSize);
-    if (result != cudaSuccess) return false;
-    
-    result = cudaMalloc(&d_previousFrame, frameSize);
-    if (result != cudaSuccess) {
-        cudaFree(d_currentFrame);
-        return false;
+    // Demo (unchanged, runs once at startup)
+    {
+        std::cout << "Running synthetic test pattern demo...\n";
+        int demo_w = 7680, demo_h = 4320;
+        std::vector<float> frame1(demo_w * demo_h * 3);
+        std::vector<float> frame2(demo_w * demo_h * 3);
+        for (int y = 0; y < demo_h; ++y) for (int x = 0; x < demo_w; ++x) {
+            int idx = (y * demo_w + x) * 3;
+            frame1[idx]   = (float)x / demo_w;  frame1[idx+1] = (float)y / demo_h;  frame1[idx+2] = 0.5f;
+            frame2[idx]   = (float)(x+10) / demo_w; frame2[idx+1] = (float)(y+5) / demo_h; frame2[idx+2] = 0.6f;
+        }
+        FrameInterpolator demoInterpolator(demo_w, demo_h);
+        for (int i = 1; i <= 3; ++i) {
+            float t = i / 4.0f;
+            auto interpolated = demoInterpolator.interpolate(frame1, frame2, t);
+            std::cout << "  Demo Frame " << i << " (t=" << t << ") generated with "
+                      << interpolated.size()/3 << " pixels\n";
+        }
+        std::cout << "Demo complete.\n\n";
     }
-    
-    result = cudaMalloc(&d_motionField, motionFieldSize);
-    if (result != cudaSuccess) {
-        cudaFree(d_currentFrame);
-        cudaFree(d_previousFrame);
-        return false;
-    }
-    
-    result = cudaMalloc(&d_upscaledFrame, TARGET_W_DEFAULT * TARGET_H_DEFAULT * 4 * sizeof(unsigned char));
-    if (result != cudaSuccess) {
-        cudaFree(d_currentFrame);
-        cudaFree(d_previousFrame);
-        cudaFree(d_motionField);
-        return false;
-    }
-    
-    return true;
-}
 
-static void freeCudaMemory() {
-    if (!cudaInitialized) return;
-    
-    if (d_currentFrame) cudaFree(d_currentFrame);
-    if (d_previousFrame) cudaFree(d_previousFrame);
-    if (d_motionField) cudaFree(d_motionField);
-    if (d_upscaledFrame) cudaFree(d_upscaledFrame);
-    
-    d_currentFrame = nullptr;
-    d_previousFrame = nullptr;
-    d_motionField = nullptr;
-    d_upscaledFrame = nullptr;
-}
+    FrameInterpolator interpolator(width, height);
 
-// CUDA-accelerated motion estimation
-static void estimateMotion(FrameBuffer& current, FrameBuffer& previous) {
-    if (current.width != previous.width || current.height != previous.height) return;
-    
-    if (cudaInitialized && d_currentFrame && d_previousFrame && d_motionField) {
-        int blocksX = current.width / MOTION_BLOCK_SIZE;
-        int blocksY = current.height / MOTION_BLOCK_SIZE;
-        
-        cudaMemcpyAsync(d_currentFrame, current.data.data(),
-                       current.width * current.height * 4 * sizeof(unsigned char),
-                       cudaMemcpyHostToDevice, cudaStream);
-        cudaMemcpyAsync(d_previousFrame, previous.data.data(),
-                       previous.width * previous.height * 4 * sizeof(unsigned char),
-                       cudaMemcpyHostToDevice, cudaStream);
-        
-        // Correct kernel call
-        launchMotionEstimationKernel(d_currentFrame, d_previousFrame, current.width, current.height, 
-                                    d_motionField, MOTION_BLOCK_SIZE, MAX_MOTION_VECTOR);
+    // DX11 + DXGI + DirectComposition setup (unchanged)
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    IDXGIOutputDuplication* dupl = nullptr;
+    IDXGIFactory1* factory = nullptr;
+    IDXGIAdapter1* adapter = nullptr;
+    IDXGIOutput* output = nullptr;
+    IDXGIOutput1* output1 = nullptr;
 
-        cudaMemcpyAsync(current.motionField.data(), d_motionField,
-                       blocksX * blocksY * sizeof(MotionVector),
-                       cudaMemcpyDeviceToHost, cudaStream);
-        
-        cudaStreamSynchronize(cudaStream);
-    } else {
-        // CPU fallback
-        int blocksX = current.width / MOTION_BLOCK_SIZE;
-        int blocksY = current.height / MOTION_BLOCK_SIZE;
-        
-        for (int by = 0; by < blocksY; by++) {
-            for (int bx = 0; bx < blocksX; bx++) {
-                int bestX = 0, bestY = 0;
-                float bestError = FLT_MAX;
-                
-                for (int dy = -MAX_MOTION_VECTOR; dy <= MAX_MOTION_VECTOR; dy += 4) {
-                    for (int dx = -MAX_MOTION_VECTOR; dx <= MAX_MOTION_VECTOR; dx += 4) {
-                        float error = 0.0f;
-                        int samples = 0;
-                        
-                        for (int py = 0; py < MOTION_BLOCK_SIZE; py += 2) {
-                            for (int px = 0; px < MOTION_BLOCK_SIZE; px += 2) {
-                                int currX = bx * MOTION_BLOCK_SIZE + px;
-                                int currY = by * MOTION_BLOCK_SIZE + py;
-                                int prevX = currX + dx;
-                                int prevY = currY + dy;
-                                
-                                if (prevX >= 0 && prevX < previous.width &&
-                                    prevY >= 0 && prevY < previous.height &&
-                                    currX >= 0 && currX < current.width &&
-                                    currY >= 0 && currY < current.height) {
-                                    
-                                    int currIdx = (currY * current.width + currX) * 4;
-                                    int prevIdx = (prevY * previous.width + prevX) * 4;
-                                    
-                                    float currLum = 0.299f * current.data[currIdx+2] +
-                                                  0.587f * current.data[currIdx+1] +
-                                                  0.114f * current.data[currIdx+0];
-                                    float prevLum = 0.299f * previous.data[prevIdx+2] +
-                                                  0.587f * previous.data[prevIdx+1] +
-                                                  0.114f * previous.data[prevIdx+0];
-                                    
-                                    error += fabsf(currLum - prevLum);
-                                    samples++;
-                                }
-                            }
-                        }
-                        
-                        if (samples > 0) {
-                            error /= samples;
-                            if (error < bestError) {
-                                bestError = error;
-                                bestX = dx;
-                                bestY = dy;
-                            }
-                        }
-                    }
-                }
-                
-                int blockIdx = by * blocksX + bx;
-                current.motionField[blockIdx] = {bestX, bestY, 1.0f - (bestError / 255.0f)};
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                                   nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context);
+    if (FAILED(hr)) { std::cerr << "Failed to create D3D11 device\n"; return -1; }
+
+    CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory);
+    factory->EnumAdapters1(0, &adapter);
+    adapter->EnumOutputs(0, &output);
+    output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
+    output1->DuplicateOutput(device, &dupl);
+
+    IDCompositionDevice* dcompDevice = nullptr;
+    IDCompositionTarget* target = nullptr;
+    IDCompositionVisual* visual = nullptr;
+    IDCompositionSurface* surface = nullptr;
+
+    DCompositionCreateDevice(nullptr, IID_PPV_ARGS(&dcompDevice));
+    dcompDevice->CreateTargetForHwnd(GetDesktopWindow(), TRUE, &target);
+    dcompDevice->CreateVisual(&visual);
+    target->SetRoot(visual);
+    dcompDevice->CreateSurface(width, height, DXGI_FORMAT_B8G8R8A8_UNORM,
+                               DXGI_ALPHA_MODE_PREMULTIPLIED, &surface);
+    visual->SetContent(surface);
+    dcompDevice->Commit();
+
+    // Helper to upload any frame (interpolated or real)
+    auto upload = [&](const std::vector<float>& frame) {
+        RECT rect = {0, 0, width, height};
+        POINT offset = {0, 0};
+        ID3D11Texture2D* surfTex = nullptr;
+        D3D11_MAPPED_SUBRESOURCE map{};
+
+        surface->BeginDraw(&rect, __uuidof(ID3D11Texture2D), (void**)&surfTex, &offset);
+        context->Map(surfTex, 0, D3D11_MAP_WRITE, 0, &map);
+
+        uint8_t* dstBase = (uint8_t*)map.pData;
+        for (int y = 0; y < height; ++y) {
+            uint8_t* dst = dstBase + map.RowPitch * y;
+            int base = y * width * 3;
+            for (int x = 0; x < width; ++x) {
+                dst[x*4 + 2] = (uint8_t)(frame[base + x*3 + 0] * 255.0f); // R
+                dst[x*4 + 1] = (uint8_t)(frame[base + x*3 + 1] * 255.0f); // G
+                dst[x*4 + 0] = (uint8_t)(frame[base + x*3 + 2] * 255.0f); // B
+                dst[x*4 + 3] = 255;
             }
         }
-    }
-}
-
-// -------------------- AI-like Upscaling System --------------------
-struct UpscalingModel {
-    float edgeKernel[9];
-    float detailKernel[9];
-    float sharpnessFactor;
-    float adaptiveThreshold;
-    
-    UpscalingModel() {
-        edgeKernel[0] = -1; edgeKernel[1] = 0; edgeKernel[2] = 1;
-        edgeKernel[3] = -2; edgeKernel[4] = 0; edgeKernel[5] = 2;
-        edgeKernel[6] = -1; edgeKernel[7] = 0; edgeKernel[8] = 1;
-        
-        detailKernel[0] = 0; detailKernel[1] = -1; detailKernel[2] = 0;
-        detailKernel[3] = -1; detailKernel[4] = 5; detailKernel[5] = -1;
-        detailKernel[6] = 0; detailKernel[7] = -1; detailKernel[8] = 0;
-        
-        sharpnessFactor = 1.5f;
-        adaptiveThreshold = 30.0f;
-    }
-    
-    void adapt(const std::vector<uint8_t>& frame, int w, int h) {
-        float avgEdgeStrength = 0.0f;
-        int samples = 0;
-        
-        for (int y = 1; y < h-1; y += 10) {
-            for (int x = 1; x < w-1; x += 10) {
-                float edgeStrength = 0.0f;
-                for (int ky = -1; ky <= 1; ky++) {
-                    for (int kx = -1; kx <= 1; kx++) {
-                        int idx = ((y + ky) * w + (x + kx)) * 4;
-                        int kernelIdx = (ky + 1) * 3 + (kx + 1);
-                        float lum = 0.299f * frame[idx+2] + 0.587f * frame[idx+1] + 0.114f * frame[idx+0];
-                        edgeStrength += lum * edgeKernel[kernelIdx];
-                    }
-                }
-                avgEdgeStrength += fabs(edgeStrength);
-                samples++;
-            }
-        }
-        
-        if (samples > 0) {
-            avgEdgeStrength /= samples;
-            if (avgEdgeStrength < adaptiveThreshold) {
-                sharpnessFactor = MIN(sharpnessFactor * 1.01f, 3.0f);
-            } else {
-                sharpnessFactor = MAX(sharpnessFactor * 0.99f, 1.2f);
-            }
-        }
-    }
-    
-    void save(const std::string &path) {
-        std::ofstream f(path, std::ios::binary);
-        if (f) {
-            f.write((char*)edgeKernel, sizeof(edgeKernel));
-            f.write((char*)detailKernel, sizeof(detailKernel));
-            f.write((char*)&sharpnessFactor, sizeof(sharpnessFactor));
-            f.write((char*)&adaptiveThreshold, sizeof(adaptiveThreshold));
-        }
-    }
-    
-    bool load(const std::string &path) {
-        std::ifstream f(path, std::ios::binary);
-        if (!f.is_open()) return false;
-        f.read((char*)edgeKernel, sizeof(edgeKernel));
-        f.read((char*)detailKernel, sizeof(detailKernel));
-        f.read((char*)&sharpnessFactor, sizeof(sharpnessFactor));
-        f.read((char*)&adaptiveThreshold, sizeof(adaptiveThreshold));
-        return true;
-    }
-};
-
-static UpscalingModel upscalingModel;
-
-// CUDA-accelerated upscaling with color transformations
-static std::vector<uint8_t> upscaleFrame(const std::vector<uint8_t>& input, int inW, int inH, int outW, int outH) {
-    std::vector<uint8_t> output(outW * outH * 4);
-    float scaleX = (float)inW / outW;
-    float scaleY = (float)inH / outH;
-    
-    if (cudaInitialized && d_upscaledFrame) {
-        cudaMemcpyAsync(d_currentFrame, input.data(),
-                       inW * inH * 4 * sizeof(unsigned char),
-                       cudaMemcpyHostToDevice, cudaStream);
-        
-        // Kernel launch
-        launchUpscalingKernel(d_currentFrame, d_upscaledFrame, inW, inH, outW, outH, scaleX, scaleY, 
-                             upscalingModel.sharpnessFactor, colorEditingParams.brightness, 
-                             colorEditingParams.contrast, colorEditingParams.saturation, 
-                             colorEditingParams.hue, colorEditingParams.gamma, 
-                             colorTransformParams.w, colorTransformParams.x, 
-                             colorTransformParams.y, colorTransformParams.z, 
-                             colorTransformParams.eta, colorTransformParams.chromaStretch, 
-                             colorTransformParams.hueWarp, colorTransformParams.lightnessFlow);
-
-        cudaMemcpyAsync(output.data(), d_upscaledFrame,
-                       outW * outH * 4 * sizeof(unsigned char),
-                       cudaMemcpyDeviceToHost, cudaStream);
-        
-        cudaStreamSynchronize(cudaStream);
-    } else {
-        // CPU fallback
-        for (int y = 0; y < outH; y++) {
-            for (int x = 0; x < outW; x++) {
-                float srcX = x * scaleX;
-                float srcY = y * scaleY;
-                
-                int x0 = (int)srcX;
-                int y0 = (int)srcY;
-                int x1 = MIN(x0 + 1, inW - 1);
-                int y1 = MIN(y0 + 1, inH - 1);
-                
-                float dx = srcX - x0;
-                float dy = srcY - y0;
-                
-                int outIdx = (y * outW + x) * 4;
-                
-                for (int c = 0; c < 3; c++) {
-                    float p00 = input[(y0 * inW + x0) * 4 + c];
-                    float p01 = input[(y0 * inW + x1) * 4 + c];
-                    float p10 = input[(y1 * inW + x0) * 4 + c];
-                    float p11 = input[(y1 * inW + x1) * 4 + c];
-                    
-                    float interpolated = p00 * (1-dx) * (1-dy) +
-                                        p01 * dx * (1-dy) +
-                                        p10 * (1-dx) * dy +
-                                        p11 * dx * dy;
-                    
-                    if (x > 0 && x < outW-1 && y > 0 && y < outH-1) {
-                        float center = interpolated;
-                        float sum = 0;
-                        for (int ky = -1; ky <= 1; ky++) {
-                            for (int kx = -1; kx <= 1; kx++) {
-                                if (kx == 0 && ky == 0) continue;
-                                int nx = x + kx;
-                                int ny = y + ky;
-                                float nSrcX = nx * scaleX;
-                                float nSrcY = ny * scaleY;
-                                int nx0 = (int)nSrcX;
-                                int ny0 = (int)nSrcY;
-                                int nx1 = MIN(nx0 + 1, inW - 1);
-                                int ny1 = MIN(ny0 + 1, inH - 1);
-                                float ndx = nSrcX - nx0;
-                                float ndy = nSrcY - ny0;
-                                
-                                float neighbor = input[(ny0 * inW + nx0) * 4 + c] * (1-ndx) * (1-ndy) +
-                                               input[(ny0 * inW + nx1) * 4 + c] * ndx * (1-ndy) +
-                                               input[(ny1 * inW + nx0) * 4 + c] * (1-ndx) * ndy +
-                                               input[(ny1 * inW + nx1) * 4 + c] * ndx * ndy;
-                                sum += neighbor;
-                            }
-                        }
-                        sum /= 8.0f;
-                        float detail = center - sum;
-                        interpolated = center + detail * upscalingModel.sharpnessFactor * 0.1f;
-                    }
-                    
-                    // Using custom clamp function instead of std::clamp
-                    output[outIdx + c] = (uint8_t)CLAMP(interpolated, 0.0f, 255.0f);
-                }
-                output[outIdx + 3] = 255;
-            }
-        }
-    }
-    
-    return output;
-}
-
-// -------------------- Enhanced Frame Interpolation --------------------
-static std::vector<uint8_t> interpolateFrames(const FrameBuffer& frame1, const FrameBuffer& frame2, float alpha, int w, int h) {
-    std::vector<uint8_t> result(w * h * 4);
-    
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            int idx = (y * w + x) * 4;
-            
-            int blockX = x / MOTION_BLOCK_SIZE;
-            int blockY = y / MOTION_BLOCK_SIZE;
-            int blockIdx = blockY * (w / MOTION_BLOCK_SIZE) + blockX;
-            
-            if (blockIdx < frame2.motionField.size()) {
-                const MotionVector& mv = frame2.motionField[blockIdx];
-                
-                int srcX = x + (int)(mv.x * alpha);
-                int srcY = y + (int)(mv.y * alpha);
-                
-                if (srcX >= 0 && srcX < w && srcY >= 0 && srcY < h) {
-                    int srcIdx = (srcY * w + srcX) * 4;
-                    
-                    for (int c = 0; c < 4; c++) {
-                        result[idx + c] = (uint8_t)(frame1.data[idx + c] * (1 - alpha) +
-                                                 frame2.data[srcIdx + c] * alpha);
-                    }
-                } else {
-                    for (int c = 0; c < 4; c++) {
-                        result[idx + c] = (uint8_t)(frame1.data[idx + c] * (1 - alpha) +
-                                                 frame2.data[idx + c] * alpha);
-                    }
-                }
-            } else {
-                for (int c = 0; c < 4; c++) {
-                    result[idx + c] = (uint8_t)(frame1.data[idx + c] * (1 - alpha) +
-                                             frame2.data[idx + c] * alpha);
-                }
-            }
-        }
-    }
-    
-    return result;
-}
-
-// Multiple interpolation per frame with adaptive quality
-static std::vector<std::vector<uint8_t>> generateMultipleInterpolatedFrames(
-    const FrameBuffer& frame1, 
-    const FrameBuffer& frame2, 
-    int targetW, 
-    int targetH,
-    int numInterpolations = MAX_INTERPOLATIONS_PER_FRAME) {
-    
-    std::vector<std::vector<uint8_t>> interpolatedFrames;
-    
-    if (numInterpolations <= 0) return interpolatedFrames;
-    
-    // Calculate motion complexity
-    float avgMotion = 0.0f;
-    int motionVectors = 0;
-    for (const auto& mv : frame2.motionField) {
-        avgMotion += sqrtf(mv.x * mv.x + mv.y * mv.y) * mv.confidence;
-        motionVectors++;
-    }
-    
-    if (motionVectors > 0) avgMotion /= motionVectors;
-    
-    // Adjust number of interpolations based on motion
-    int adjustedInterpolations = MIN(numInterpolations, 
-                                  MAX(1, (int)(avgMotion / 5.0f)));
-    
-    // Generate interpolated frames
-    for (int i = 1; i <= adjustedInterpolations; i++) {
-        float alpha = (float)i / (adjustedInterpolations + 1);
-        interpolatedFrames.push_back(interpolateFrames(frame1, frame2, alpha, targetW, targetH));
-    }
-    
-    return interpolatedFrames;
-}
-
-// -------------------- Capture: Desktop Duplication + GDI fallback --------------------
-struct DDAContext {
-    ComPtr<ID3D11Device> device;
-    ComPtr<ID3D11DeviceContext> context;
-    ComPtr<IDXGIOutputDuplication> duplication;
-    ComPtr<IDXGIOutput1> output1;
-    bool initialized = false;
-    int width=0, height=0;
-};
-
-static bool init_dda(DDAContext &ctx) {
-    HRESULT hr;
-    D3D_FEATURE_LEVEL fl;
-    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-    
-    // Fixed D3D11CreateDevice call
-    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags, nullptr, 0, 
-                          D3D11_SDK_VERSION, ctx.device.GetAddressOf(), &fl, 
-                          reinterpret_cast<ID3D11DeviceContext**>(
-                              ctx.context.GetAddressOf()));
-    if (FAILED(hr) || !ctx.device) {
-        return false;
-    }
-    
-    ComPtr<IDXGIDevice> dxgiDev;
-    hr = ctx.device->QueryInterface(__uuidof(IDXGIDevice), 
-                                   reinterpret_cast<void**>(dxgiDev.GetAddressOf()));
-    if (FAILED(hr) || !dxgiDev) return false;
-    
-    ComPtr<IDXGIAdapter> adapter;
-    hr = dxgiDev->GetAdapter(adapter.GetAddressOf());
-    if (FAILED(hr) || !adapter) return false;
-    
-    ComPtr<IDXGIOutput> output;
-    hr = adapter->EnumOutputs(0, output.GetAddressOf());
-    if (FAILED(hr) || !output) return false;
-    
-    hr = output->QueryInterface(__uuidof(IDXGIOutput1), 
-                               reinterpret_cast<void**>(ctx.output1.GetAddressOf()));
-    if (FAILED(hr) || !ctx.output1) return false;
-    
-    RECT r;
-    GetClientRect(GetDesktopWindow(), &r);
-    ctx.width = r.right - r.left;
-    ctx.height = r.bottom - r.top;
-    
-    // Fixed DuplicateOutput call
-    hr = ctx.output1->DuplicateOutput(ctx.device.Get(), ctx.duplication.GetAddressOf());
-    if (FAILED(hr) || !ctx.duplication) return false;
-    
-    ctx.initialized = true;
-    return true;
-}
-
-static bool grab_frame_dda(DDAContext &ctx, std::vector<uint8_t> &out_bgra, int &w, int &h) {
-    if (!ctx.initialized) return false;
-    
-    IDXGIResource* desktopResource = nullptr;
-    DXGI_OUTDUPL_FRAME_INFO frameInfo;
-    HRESULT hr = ctx.duplication->AcquireNextFrame(0, &frameInfo, &desktopResource);
-    
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) return false;
-    if (FAILED(hr) || !desktopResource) return false;
-    
-    ComPtr<ID3D11Texture2D> tex;
-    hr = desktopResource->QueryInterface(__uuidof(ID3D11Texture2D), 
-                                        reinterpret_cast<void**>(tex.GetAddressOf()));
-    desktopResource->Release();
-    if (FAILED(hr) || !tex) return false;
-    
-    D3D11_TEXTURE2D_DESC desc;
-    tex->GetDesc(&desc);
-    w = desc.Width;
-    h = desc.Height;
-    
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    desc.BindFlags = 0;
-    desc.MiscFlags = 0;
-    
-    ComPtr<ID3D11Texture2D> staging;
-    hr = ctx.device->CreateTexture2D(&desc, nullptr, staging.GetAddressOf());
-    if (FAILED(hr) || !staging) {
-        ctx.duplication->ReleaseFrame();
-        return false;
-    }
-    
-    ctx.context->CopyResource(staging.Get(), tex.Get());
-    
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    hr = ctx.context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) {
-        ctx.duplication->ReleaseFrame();
-        return false;
-    }
-    
-    size_t rowBytes = w * 4;
-    out_bgra.resize(rowBytes * h);
-    for (int y = 0; y < h; y++) {
-        memcpy(&out_bgra[y * rowBytes], 
-               (uint8_t*)mapped.pData + y * mapped.RowPitch, 
-               rowBytes);
-    }
-    
-    ctx.context->Unmap(staging.Get(), 0);
-    ctx.duplication->ReleaseFrame();
-    return true;
-}
-
-static bool grab_frame_gdi(std::vector<uint8_t> &out_bgra, int &w, int &h) {
-    HDC hScreen = GetDC(NULL);
-    HDC hMem = CreateCompatibleDC(hScreen);
-    
-    RECT r;
-    GetClientRect(GetDesktopWindow(), &r);
-    w = r.right - r.left;
-    h = r.bottom - r.top;
-    
-    HBITMAP hBitmap = CreateCompatibleBitmap(hScreen, w, h);
-    HBITMAP old = (HBITMAP)SelectObject(hMem, hBitmap);
-    
-    if (!BitBlt(hMem, 0, 0, w, h, hScreen, 0, 0, SRCCOPY|CAPTUREBLT)) {
-        SelectObject(hMem, old);
-        DeleteObject(hBitmap);
-        DeleteDC(hMem);
-        ReleaseDC(NULL, hScreen);
-        return false;
-    }
-    
-    BITMAPINFOHEADER bi = { sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB, 0, 0, 0, 0, 0 };
-    out_bgra.resize((size_t)w * h * 4);
-    
-    if (!GetDIBits(hMem, hBitmap, 0, h, out_bgra.data(), (BITMAPINFO*)&bi, DIB_RGB_COLORS)) {
-        SelectObject(hMem, old);
-        DeleteObject(hBitmap);
-        DeleteDC(hMem);
-        ReleaseDC(NULL, hScreen);
-        return false;
-    }
-    
-    SelectObject(hMem, old);
-    DeleteObject(hBitmap);
-    DeleteDC(hMem);
-    ReleaseDC(NULL, hScreen);
-    return true;
-}
-
-// -------------------- Enhanced DirectComposition overlay --------------------
-struct DCompContext {
-    ComPtr<ID3D11Device> d3dDevice;
-    ComPtr<ID3D11DeviceContext> d3dContext;
-    ComPtr<IDXGIDevice> dxgiDevice;
-    ComPtr<IDXGIAdapter> dxgiAdapter;
-    ComPtr<IDXGIFactory2> dxgiFactory;
-    ComPtr<IDCompositionDevice> dcompDevice;
-    ComPtr<IDCompositionTarget> dcompTarget;
-    ComPtr<IDCompositionVisual> dcompVisual;
-    ComPtr<ID3D11Texture2D> texture;
-    ComPtr<IDXGISurface> surface;
-    ComPtr<IDCompositionSurface> dcompSurface;
-    HWND hwndOverlay = nullptr;
-    bool initialized = false;
-    int width = 0, height = 0;
-    
-    void cleanup() {
-        if (hwndOverlay) {
-            DestroyWindow(hwndOverlay);
-            hwndOverlay = nullptr;
-        }
-        
-        texture.Release();
-        surface.Release();
-        dcompSurface.Release();
-        dcompVisual.Release();
-        dcompTarget.Release();
-        dcompDevice.Release();
-        dxgiFactory.Release();
-        dxgiAdapter.Release();
-        dxgiDevice.Release();
-        d3dContext.Release();
-        d3dDevice.Release();
-        
-        initialized = false;
-    }
-};
-
-static HWND create_overlay_window(int width, int height) {
-    WNDCLASSA wc = {0};
-    wc.lpfnWndProc = DefWindowProcA;
-    wc.hInstance = GetModuleHandle(NULL);
-    wc.lpszClassName = "SupervisorOverlayClass";
-    RegisterClassA(&wc);
-    
-    DWORD exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
-    HWND h = CreateWindowExA(exStyle, wc.lpszClassName, "SupervisorOverlay", WS_POPUP,
-                             0, 0, width, height, NULL, NULL, GetModuleHandle(NULL), NULL);
-    if (!h) return NULL;
-    
-    SetLayeredWindowAttributes(h, RGB(0, 0, 0), 255, LWA_ALPHA);
-    
-    SetWindowPos(h, HWND_TOPMOST, 0, 0, width, height, SWP_SHOWWINDOW | SWP_NOACTIVATE);
-    ShowWindow(h, SW_SHOW);
-    return h;
-}
-
-static bool init_dcomp(DCompContext &ctx, int w, int h) {
-    ctx.cleanup();
-    
-    ctx.hwndOverlay = create_overlay_window(w, h);
-    if (!ctx.hwndOverlay) return false;
-    
-    D3D_FEATURE_LEVEL fl;
-    HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 
-                                  D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, 
-                                  D3D11_SDK_VERSION, ctx.d3dDevice.GetAddressOf(), 
-                                  &fl, reinterpret_cast<ID3D11DeviceContext**>(
-                                      ctx.d3dContext.GetAddressOf()));
-    if (FAILED(hr) || !ctx.d3dDevice) return false;
-    
-    hr = ctx.d3dDevice->QueryInterface(__uuidof(IDXGIDevice), 
-                                      reinterpret_cast<void**>(ctx.dxgiDevice.GetAddressOf()));
-    if (FAILED(hr) || !ctx.dxgiDevice) return false;
-    
-    hr = ctx.dxgiDevice->GetAdapter(ctx.dxgiAdapter.GetAddressOf());
-    if (FAILED(hr) || !ctx.dxgiAdapter) return false;
-    
-    hr = ctx.dxgiAdapter->GetParent(__uuidof(IDXGIFactory2), 
-                                   reinterpret_cast<void**>(ctx.dxgiFactory.GetAddressOf()));
-    if (FAILED(hr) || !ctx.dxgiFactory) return false;
-    
-    hr = DCompositionCreateDevice(ctx.dxgiDevice.Get(), __uuidof(IDCompositionDevice), 
-                                 reinterpret_cast<void**>(ctx.dcompDevice.GetAddressOf()));
-    if (FAILED(hr) || !ctx.dcompDevice) return false;
-    
-    hr = ctx.dcompDevice->CreateTargetForHwnd(ctx.hwndOverlay, TRUE, 
-                                             ctx.dcompTarget.GetAddressOf());
-    if (FAILED(hr) || !ctx.dcompTarget) return false;
-    
-    hr = ctx.dcompDevice->CreateVisual(ctx.dcompVisual.GetAddressOf());
-    if (FAILED(hr) || !ctx.dcompVisual) return false;
-    
-    hr = ctx.dcompDevice->CreateSurface(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, 
-                                       DXGI_ALPHA_MODE_PREMULTIPLIED, 
-                                       ctx.dcompSurface.GetAddressOf());
-    if (FAILED(hr) || !ctx.dcompSurface) return false;
-    
-    ctx.dcompTarget->SetRoot(ctx.dcompVisual.Get());
-    ctx.width = w;
-    ctx.height = h;
-    ctx.initialized = true;
-    
-    return true;
-}
-
-static bool present_via_dcomp(DCompContext &ctx, const std::vector<uint8_t>& bgra, int w, int h) {
-    if (!ctx.initialized) return false;
-    
-    // Update surface with new frame data
-    RECT updateRect = {0, 0, w, h};
-    POINT updateOffset;
-    IDXGISurface* rawSurface = nullptr;
-    
-    // Fixed IID_PPV_ARGS usage
-    HRESULT hr = ctx.dcompSurface->BeginDraw(&updateRect, IID_IDXGISurface, (void**)&rawSurface, &updateOffset);
-    if (FAILED(hr) || !rawSurface) return false;
-
-    ComPtr<IDXGISurface> surface(rawSurface);
-
-    ComPtr<ID3D11Texture2D> texture;
-    hr = surface->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(texture.GetAddressOf()));
-    if (FAILED(hr) || !texture) {
-        ctx.dcompSurface->EndDraw();
-        return false;
-    }
-
-    D3D11_TEXTURE2D_DESC desc;
-    texture->GetDesc(&desc);
-
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    hr = ctx.d3dContext->Map(texture.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (FAILED(hr)) {
-        ctx.dcompSurface->EndDraw();
-        return false;
-    }
-
-    // Copy frame data to texture
-    uint8_t* dest = static_cast<uint8_t*>(mapped.pData);
-    const uint8_t* src = bgra.data();
-
-    for (int y = 0; y < h; y++) {
-        memcpy(dest + y * mapped.RowPitch, src + y * w * 4, w * 4);
-    }
-
-    ctx.d3dContext->Unmap(texture.Get(), 0);
-
-    hr = ctx.dcompSurface->EndDraw();
-    if (FAILED(hr)) return false;
-
-    // Set the surface as content for the visual
-    ctx.dcompVisual->SetContent(ctx.dcompSurface.Get());
-
-    // Commit changes
-    hr = ctx.dcompDevice->Commit();
-    if (FAILED(hr)) return false;
-
-    return true;
-}
-
-// -------------------- HDR10+ Metadata Processing --------------------
-static void processHDRMetadata(const std::vector<uint8_t>& frameData) {
-    // This is a simplified implementation
-    // In a real scenario, you would parse the HDR metadata from the frame
-    
-    // For demonstration, we'll create some dummy metadata
-    std::vector<uint8_t> dummyMetadata;
-    
-    // Add some dummy HDR10+ metadata
-    dummyMetadata.push_back(0x01);  // Version
-    dummyMetadata.push_back(0x00);  // Reserved
-    dummyMetadata.push_back(0x0A);  // Number of scenes
-    dummyMetadata.push_back(0x00);  // Reserved
-    
-    // Add scene data
-    for (int i = 0; i < 10; i++) {
-        dummyMetadata.push_back(i * 10);  // Scene frame number
-        dummyMetadata.push_back(100 + i * 10);  // MaxRGB
-        dummyMetadata.push_back(50 + i * 5);   // AvgRGB
-        dummyMetadata.push_back(200 + i * 5);  // MaxSCL
-    }
-    
-    hdrMetadata.parse(dummyMetadata);
-}
-
-// -------------------- Color Transformation Functions --------------------
-static void applyColorTransform(std::vector<uint8_t>& frame, int w, int h) {
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            int idx = (y * w + x) * 4;
-            
-            // Get normalized RGB values
-            float r = frame[idx + 2] / 255.0f;
-            float g = frame[idx + 1] / 255.0f;
-            float b = frame[idx + 0] / 255.0f;
-            
-            // Apply color space transformations
-            float combined = colorTransformParams.w * r + 
-                           colorTransformParams.x * g + 
-                           colorTransformParams.y * b + 
-                           colorTransformParams.z * (r + g + b) / 3.0f + 
-                           colorTransformParams.eta;
-            
-            r = r * (1.0f - colorTransformParams.chromaStretch) + combined * colorTransformParams.chromaStretch;
-            g = g * (1.0f - colorTransformParams.chromaStretch) + combined * colorTransformParams.chromaStretch;
-            b = b * (1.0f - colorTransformParams.chromaStretch) + combined * colorTransformParams.chromaStretch;
-            
-            // Apply hue rotation
-            float h = atan2f(sqrtf(3.0f) * (g - b), 2.0f * r - g - b) + colorTransformParams.hueWarp;
-            float s = sqrtf((r - g) * (r - g) + (g - b) * (g - b) + (b - r) * (b - r)) / sqrtf(2.0f);
-            float l = (r + g + b) / 3.0f;
-            
-            r = l + s * cosf(h);
-            g = l + s * cosf(h - 2.0f * 3.14159f / 3.0f);
-            b = l + s * cosf(h + 2.0f * 3.14159f / 3.0f);
-            
-            // Apply brightness, contrast, saturation
-            r = (r - 0.5f) * colorEditingParams.contrast + 0.5f + colorEditingParams.brightness;
-            g = (g - 0.5f) * colorEditingParams.contrast + 0.5f + colorEditingParams.brightness;
-            b = (b - 0.5f) * colorEditingParams.contrast + 0.5f + colorEditingParams.brightness;
-            
-            float gray = 0.299f * r + 0.587f * g + 0.114f * b;
-            r = gray + colorEditingParams.saturation * (r - gray);
-            g = gray + colorEditingParams.saturation * (g - gray);
-            b = gray + colorEditingParams.saturation * (b - gray);
-            
-            // Apply gamma correction
-            r = powf(r, 1.0f / colorEditingParams.gamma);
-            g = powf(g, 1.0f / colorEditingParams.gamma);
-            b = powf(b, 1.0f / colorEditingParams.gamma);
-            
-            // Using custom clamp instead of std::clamp
-            frame[idx + 0] = (uint8_t)CLAMP(b * 255.0f, 0.0f, 255.0f);
-            frame[idx + 1] = (uint8_t)CLAMP(g * 255.0f, 0.0f, 255.0f);
-            frame[idx + 2] = (uint8_t)CLAMP(r * 255.0f, 0.0f, 255.0f);
-        }
-    }
-}
-
-// -------------------- Dynamic Color Analysis --------------------
-static void analyzeFrameAndAdjustParams(std::vector<uint8_t>& frame, int w, int h) {
-    // Calculate average brightness
-    float avgBrightness = 0.0f;
-    int pixelCount = w * h;
-    
-    for (int i = 0; i < pixelCount * 4; i += 4) {
-        float r = frame[i + 2] / 255.0f;
-        float g = frame[i + 1] / 255.0f;
-        float b = frame[i + 0] / 255.0f;
-        avgBrightness += (0.299f * r + 0.587f * g + 0.114f * b);
-    }
-    avgBrightness /= pixelCount;
-    
-    // Calculate average color balance
-    float avgR = 0.0f, avgG = 0.0f, avgB = 0.0f;
-    for (int i = 0; i < pixelCount * 4; i += 4) {
-        avgR += frame[i + 2] / 255.0f;
-        avgG += frame[i + 1] / 255.0f;
-        avgB += frame[i + 0] / 255.0f;
-    }
-    avgR /= pixelCount;
-    avgG /= pixelCount;
-    avgB /= pixelCount;
-    
-    // Calculate contrast (simplified)
-    float contrast = 0.0f;
-    for (int i = 0; i < pixelCount * 4; i += 4) {
-        float r = frame[i + 2] / 255.0f;
-        float g = frame[i + 1] / 255.0f;
-        float b = frame[i + 0] / 255.0f;
-        float lum = 0.299f * r + 0.587f * g + 0.114f * b;
-        contrast += (lum - avgBrightness) * (lum - avgBrightness);
-    }
-    contrast = sqrtf(contrast / pixelCount);
-    
-    // Adjust parameters based on analysis
-    // Brightness correction
-    if (avgBrightness < 0.3f) {
-        colorEditingParams.brightness += 0.05f;
-    } else if (avgBrightness > 0.7f) {
-        colorEditingParams.brightness -= 0.05f;
-    }
-    
-    // Contrast correction
-    if (contrast < 0.2f) {
-        colorEditingParams.contrast += 0.1f;
-    } else if (contrast > 0.4f) {
-        colorEditingParams.contrast -= 0.05f;
-    }
-    
-    // Color balance correction
-    float gray = (avgR + avgG + avgB) / 3.0f;
-    colorTransformParams.w = 1.0f + (gray - avgR) * 0.5f;
-    colorTransformParams.x = 1.0f + (gray - avgG) * 0.5f;
-    colorTransformParams.y = 1.0f + (gray - avgB) * 0.5f;
-    
-    // Clamp values
-    colorEditingParams.brightness = CLAMP(colorEditingParams.brightness, -0.5f, 0.5f);
-    colorEditingParams.contrast = CLAMP(colorEditingParams.contrast, 0.5f, 2.0f);
-    colorTransformParams.w = CLAMP(colorTransformParams.w, 0.5f, 1.5f);
-    colorTransformParams.x = CLAMP(colorTransformParams.x, 0.5f, 1.5f);
-    colorTransformParams.y = CLAMP(colorTransformParams.y, 0.5f, 1.5f);
-}
-
-// -------------------- Dynamic HDR10+ Metadata to Color Mapping --------------------
-static void ApplyHDR10PlusDynamicMetadata(
-    const HDR10PlusMetadata& hdr,
-    ColorEditingParams& edit)
-{
-    if (!hdr.isAvailable || hdr.data.size() < 10) {
-        return;
-    }
-
-    // EXPECTED HDR10+ STRUCTURE (simplified):
-    // data[0]  : targeted system luminance low (0–255)
-    // data[1]  : targeted system luminance high (0–255)
-    // data[2]  : maxCLL (0–255 scaled)
-    // data[3]  : maxFALL
-    // data[4]  : avgRGB saturation boost (signed, -128..127)
-    // data[5]  : tone-mapping knee point
-    // data[6]  : tone-mapping strength
-    // data[7]  : color warmth shift (signed)
-    // data[8]  : gamma modification
-    // data[9]  : scene contrast index
-
-    float lowLum   = hdr.data[0]  / 255.0f;
-    float highLum  = hdr.data[1]  / 255.0f;
-    float maxCLL   = hdr.data[2]  / 255.0f;
-    float maxFALL  = hdr.data[3]  / 255.0f;
-
-    int satBoost_i = (int8_t)hdr.data[4];
-    float satBoost = satBoost_i / 128.0f;
-
-    float kneePoint = hdr.data[5] / 255.0f;
-    float kneeStrength = hdr.data[6] / 255.0f;
-
-    int warmthShift_i = (int8_t)hdr.data[7];
-    float warmthShift = warmthShift_i / 128.0f;
-
-    float gammaMod = hdr.data[8] / 255.0f;
-
-    float sceneContrast = hdr.data[9] / 255.0f;
-
-    // ACTUAL COLOR EDITING ADJUSTMENTS
-
-    // Auto-brightness from luminance & FALL
-    edit.brightness += (highLum - lowLum) * 0.35f;
-    edit.brightness += maxFALL * 0.15f;
-
-    // Auto contrast from scene contrast + knee strength
-    edit.contrast *= (1.0f + sceneContrast * 0.40f + kneeStrength * 0.25f);
-
-    // Auto saturation
-    edit.saturation *= (1.0f + satBoost * 0.50f);
-
-    // Auto hue (warmth shift)
-    edit.hue += warmthShift * 10.0f;  // degrees
-
-    // Auto gamma correction
-    edit.gamma *= (1.0f + gammaMod * 0.30f);
-
-    // Safety clamp
-    edit.brightness = CLAMP(edit.brightness, -1.0f, 1.0f);
-    edit.contrast   = CLAMP(edit.contrast,   0.1f,  3.0f);
-    edit.saturation = CLAMP(edit.saturation, 0.1f,  3.0f);
-    edit.gamma      = CLAMP(edit.gamma,      0.5f,  3.0f);
-    // hue can be freeform
-}
-
-// -------------------- GDI Color Metrics Capture --------------------
-static float EstimateGamma(const WORD* lut)
-{
-    float x1 = 64.0f / 255.0f;
-    float x2 = 192.0f / 255.0f;
-
-    float y1 = lut[64] / 65535.0f;
-    float y2 = lut[192] / 65535.0f;
-
-    if (y1 <= 0 || y2 <= 0) return 1.0f;
-
-    float g1 = logf(y1) / logf(x1);
-    float g2 = logf(y2) / logf(x2);
-
-    float g = (g1 + g2) * 0.5f;
-
-    if (g < 0.5f || g > 5.0f) return 1.0f;
-    return g;
-}
-
-static GDIColorMetrics CaptureGDIColorMetrics()
-{
-    GDIColorMetrics m = {};
-
-    HDC hdc = GetDC(NULL);
-    if (!hdc) return m;
-
-    if (!GetDeviceGammaRamp(hdc, m.ramp)) {
-        ReleaseDC(NULL, hdc);
-        return m;
-    }
-
-    ReleaseDC(NULL, hdc);
-
-    // Gamma per channel
-    m.gammaR = EstimateGamma(m.ramp[0]);
-    m.gammaG = EstimateGamma(m.ramp[1]);
-    m.gammaB = EstimateGamma(m.ramp[2]);
-
-    // Brightness from ramp centroid
-    float rMid = m.ramp[0][128] / 65535.0f;
-    float gMid = m.ramp[1][128] / 65535.0f;
-    float bMid = m.ramp[2][128] / 65535.0f;
-
-    m.brightness = (rMid + gMid + bMid) / 3.0f;  // 0..1 normalized
-
-    // Contrast from slope of ramp (difference between end and start)
-    auto slope = [](const WORD* lut) {
-        float y0 = lut[16]  / 65535.0f;
-        float y1 = lut[240] / 65535.0f;
-        return (y1 - y0);  // 0..1 domain
+        context->Unmap(surfTex, 0);
+        surfTex->Release();
+        surface->EndDraw();
+        dcompDevice->Commit();
     };
 
-    float cR = slope(m.ramp[0]);
-    float cG = slope(m.ramp[1]);
-    float cB = slope(m.ramp[2]);
+    std::vector<float> prev(width * height * 3);
+    std::vector<float> curr(width * height * 3);
+    bool first = true;
+    const int fake_frames = 7;   // 8× total smoothness
 
-    m.contrast = (cR + cG + cB) * 0.3333f;
+    std::cout << "Starting real-time interpolation (+" << fake_frames << " fake frames per real frame)\n";
+    std::cout << "Close console window or press Alt+F4 to stop.\n\n";
 
-    // White-point deltas (RGB bias)
-    m.deltaR = rMid - (gMid + bMid) * 0.5f;
-    m.deltaG = gMid - (rMid + bMid) * 0.5f;
-    m.deltaB = bMid - (rMid + gMid) * 0.5f;
+    while (true) {
+        DXGI_OUTDUPL_FRAME_INFO frameInfo;
+        IDXGIResource* desktopRes = nullptr;
 
-    return m;
-}
+        hr = dupl->AcquireNextFrame(16, &frameInfo, &desktopRes);
+        if (FAILED(hr)) { Sleep(1); continue; }
 
-// -------------------- Priority --------------------
-static void set_high_priority(){
-    SetPriorityClass(GetCurrentProcess(),REALTIME_PRIORITY_CLASS);
-    HMODULE hAv=LoadLibraryA("avrt.dll");
-    if(hAv){
-        typedef HANDLE(WINAPI *AVSET)(LPCSTR,LPDWORD);
-        typedef BOOL(WINAPI*AVSETP)(HANDLE,LPDWORD);
-        AVSET pSet=(AVSET)GetProcAddress(hAv,"AvSetMmThreadCharacteristicsA");
-        AVSETP pSetP=(AVSETP)GetProcAddress(hAv,"AvSetMmThreadPriority");
-        if(pSet&&pSetP){
-            DWORD idx=0;
-            HANDLE h=pSet("Pro Audio",&idx);
-            if(h) pSetP(h,(LPDWORD)3);
-        }
-    }
-}
+        ID3D11Texture2D* gpuFrame = nullptr;
+        desktopRes->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&gpuFrame);
 
-// -------------------- High precision sleep --------------------
-static void sleep_until(std::chrono::steady_clock::time_point t){
-    using namespace std::chrono;
-    auto now=steady_clock::now();
-    while(now+milliseconds(2)<t){
-        std::this_thread::sleep_for(milliseconds(1));
-        now=steady_clock::now();
-    }
-    if(now<t) std::this_thread::sleep_for(t-now);
-}
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = width; desc.Height = height;
+        desc.MipLevels = desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
-// -------------------- Enhanced Processing Pipeline --------------------
-static void enhance_quality(std::vector<uint8_t>& bgra, int w, int h) {
-    currentFrame.data = bgra;
-    currentFrame.width = w;
-    currentFrame.height = h;
-    
-    // Process HDR metadata
-    processHDRMetadata(bgra);
-    
-    // Apply HDR10+ metadata to color editing parameters
-    ApplyHDR10PlusDynamicMetadata(hdrMetadata, colorEditingParams);
-    
-    // Analyze frame and adjust color parameters dynamically
-    analyzeFrameAndAdjustParams(bgra, w, h);
-    
-    // Apply color transformations
-    applyColorTransform(bgra, w, h);
-    
-    if (prevFrame.width == w && prevFrame.height == h) {
-        estimateMotion(currentFrame, prevFrame);
-        
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int idx = (y * w + x) * 4;
-                
-                int blockX = x / MOTION_BLOCK_SIZE;
-                int blockY = y / MOTION_BLOCK_SIZE;
-                int blockIdx = blockY * (w / MOTION_BLOCK_SIZE) + blockX;
-                
-                if (blockIdx < currentFrame.motionField.size()) {
-                    const MotionVector& mv = currentFrame.motionField[blockIdx];
-                    float motionStrength = sqrt(mv.x * mv.x + mv.y * mv.y);
-                    
-                    float filterStrength = MAX(0.1f, 1.0f - motionStrength / MAX_MOTION_VECTOR);
-                    
-                    if (motionStrength < 5.0f) {
-                        int prevIdx = idx;
-                        for (int c = 0; c < 3; c++) {
-                            bgra[idx + c] = (uint8_t)(bgra[idx + c] * 0.7f +
-                                                     prevFrame.data[prevIdx + c] * 0.3f);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    upscalingModel.adapt(bgra, w, h);
-    
-    prevFrame = currentFrame;
-}
+        ID3D11Texture2D* cpuTex = nullptr;
+        device->CreateTexture2D(&desc, nullptr, &cpuTex);
+        context->CopyResource(cpuTex, gpuFrame);
 
-static void processFrameWithVerification(std::vector<uint8_t>& bgra, int w, int h) {
-    std::vector<uint8_t> before = bgra;
-    
-    enhance_quality(bgra, w, h);
-    
-    if (w < TARGET_W_DEFAULT || h < TARGET_H_DEFAULT) {
-        bgra = upscaleFrame(bgra, w, h, TARGET_W_DEFAULT, TARGET_H_DEFAULT);
-        w = TARGET_W_DEFAULT;
-        h = TARGET_H_DEFAULT;
-    }
-    
-    int changedPixels = 0;
-    int totalDiff = 0;
-    
-    for (int i = 0; i < MIN(before.size(), bgra.size()); i += 4) {
-        int diff = abs(before[i] - bgra[i]) + abs(before[i+1] - bgra[i+1]) + abs(before[i+2] - bgra[i+2]);
-        if (diff > 10) {
-            changedPixels++;
-            totalDiff += diff;
-        }
-    }
-}
+        D3D11_MAPPED_SUBRESOURCE map{};
+        context->Map(cpuTex, 0, D3D11_MAP_READ, 0, &map);
+        const uint8_t* src = (const uint8_t*)map.pData;
 
-// -------------------- Frame Rate Management --------------------
-static std::vector<std::vector<uint8_t>> generateInterpolatedFrames(int targetW, int targetH) {
-    if (frameDataHistory.size() < 2) {
-        return {std::vector<uint8_t>(targetW * targetH * 4, 0)};
-    }
-    
-    const auto& frame1 = frameDataHistory[frameDataHistory.size() - 2];
-    const auto& frame2 = frameDataHistory[frameDataHistory.size() - 1];
-    
-    FrameBuffer f1, f2;
-    f1.data = frame1;
-    f1.width = targetW;
-    f1.height = targetH;
-    f2.data = frame2;
-    f2.width = targetW;
-    f2.height = targetH;
-    
-    estimateMotion(f2, f1);
-    
-    return generateMultipleInterpolatedFrames(f1, f2, targetW, targetH, MAX_INTERPOLATIONS_PER_FRAME);
-}
-
-// -------------------- REAL-TIME CUDA COLOR OVERLAY --------------------
-static std::atomic<bool> g_overlayRunning{ true };
-static cudaGraphicsResource* g_cudaResource = nullptr;
-static ID3D11Texture2D* g_stagingTex = nullptr;
-
-static void RunColorOverlay(ID3D11Device* device, ID3D11DeviceContext* context, IDXGIOutput1* output1)
-{
-    if (!device || !output1) return;
-
-    IDXGIOutputDuplication* duplRaw = nullptr;
-    HRESULT hr = output1->DuplicateOutput(device, &duplRaw);
-    if (FAILED(hr)) {
-        printf("DuplicateOutput failed: 0x%X\n", hr);
-        return;
-    }
-    ComPtr<IDXGIOutputDuplication> dupl(duplRaw);
-
-    DXGI_OUTPUT_DESC outDesc{};
-    output1->GetDesc(&outDesc);
-    int w = outDesc.DesktopCoordinates.right - outDesc.DesktopCoordinates.left;
-    int h = outDesc.DesktopCoordinates.bottom - outDesc.DesktopCoordinates.top;
-
-    D3D11_TEXTURE2D_DESC texDesc{};
-    texDesc.Width = w;
-    texDesc.Height = h;
-    texDesc.MipLevels = 1;
-    texDesc.ArraySize = 1;
-    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    texDesc.SampleDesc.Count = 1;
-    texDesc.Usage = D3D11_USAGE_DEFAULT;
-    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    texDesc.CPUAccessFlags = 0;
-
-    if (FAILED(device->CreateTexture2D(&texDesc, nullptr, &g_stagingTex))) {
-        printf("Failed to create staging texture\n");
-        return;
-    }
-
-    cudaError_t cuErr = cudaGraphicsD3D11RegisterResource(&g_cudaResource, g_stagingTex,
-        cudaGraphicsRegisterFlagsSurfaceLoadStore);
-    if (cuErr != cudaSuccess) {
-        printf("CUDA register failed: %s\n", cudaGetErrorString(cuErr));
-        return;
-    }
-
-    dim3 threads(16, 16);
-    dim3 blocks((w + 15) / 16, (h + 15) / 16);
-
-    while (g_overlayRunning.load())
-    {
-        DXGI_OUTDUPL_FRAME_INFO frameInfo{};
-        IDXGIResource* desktopResource = nullptr;
-
-        hr = dupl->AcquireNextFrame(100, &frameInfo, &desktopResource);
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-        if (FAILED(hr)) {
-            if (hr == DXGI_ERROR_ACCESS_LOST) break;
-            continue;
+        // 1. Copy new real frame into curr
+        #pragma omp parallel for
+        for (int i = 0; i < width * height; ++i) {
+            curr[i*3 + 0] = src[i*4 + 2] / 255.0f; // R
+            curr[i*3 + 1] = src[i*4 + 1] / 255.0f; // G
+            curr[i*3 + 2] = src[i*4 + 0] / 255.0f; // B
         }
 
-        ID3D11Texture2D* frameTexRaw = nullptr;
-        desktopResource->QueryInterface(IID_ID3D11Texture2D, (void**)&frameTexRaw);
-        ComPtr<ID3D11Texture2D> frameTex(frameTexRaw);
-        desktopResource->Release();
-
-        context->CopyResource(g_stagingTex, frameTex.Get());
+        context->Unmap(cpuTex, 0);
+        cpuTex->Release();
+        gpuFrame->Release();
+        desktopRes->Release();
         dupl->ReleaseFrame();
 
-        // Map CUDA resource
-        cudaGraphicsMapResources(1, &g_cudaResource, 0);
-        Color* devPtr = nullptr;
-        size_t numBytes = 0;
-        cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &numBytes, g_cudaResource);
+        // 2. NOW apply full color enhancement to the real frame
+        float motion_mag = interpolator.motion_estimator.getMotionMagnitude();
+        interpolator.color_engine.adaptFromMotion(motion_mag, 0.1f);
 
-        // Capture GDI color metrics
-        GDIColorMetrics metrics = CaptureGDIColorMetrics();
+        #pragma omp parallel for
+        for (int i = 0; i < width * height * 3; i += 3) {
+            Vec3 p(curr[i], curr[i+1], curr[i+2]);
+            Vec3 e = interpolator.color_engine.processPixel(p, 0.02f, 0.01f);
+            curr[i]   = e.x;
+            curr[i+1] = e.y;
+            curr[i+2] = e.z;
+        }
 
-        // Launch kernel with GDI metrics
-        launchAdjustKernel(devPtr, w, h, metrics.brightness, 
-                          (metrics.gammaR + metrics.gammaG + metrics.gammaB) / 3.0f, 
-                          metrics.contrast, metrics.deltaR, metrics.deltaG, metrics.deltaB);
-        cudaDeviceSynchronize();
-
-        cudaGraphicsUnmapResources(1, &g_cudaResource, 0);
-    }
-
-    // Cleanup
-    if (g_cudaResource) cudaGraphicsUnregisterResource(g_cudaResource);
-    g_cudaResource = nullptr;
-    if (g_stagingTex) {
-        g_stagingTex->Release();
-        g_stagingTex = nullptr;
-    }
-}
-
-// -------------------- MAIN SUPERVISOR LOOP + CLEANUP IN ONE FUNCTION --------------------
-static void RunSupervisor()
-{
-    DDAContext ddaCtx;
-    if (!init_dda(ddaCtx)) {
-        printf("Failed to init desktop duplication\n");
-        return;
-    }
-
-    DCompContext dcompCtx;
-    if (!init_dcomp(dcompCtx, TARGET_W_DEFAULT, TARGET_H_DEFAULT)) {
-        printf("Failed to init DirectComposition\n");
-        return;
-    }
-
-    if (cudaInitialized) {
-        allocateCudaMemory(TARGET_W_DEFAULT, TARGET_H_DEFAULT);
-    }
-
-    upscalingModel.load(std::string(MODULES_DIR) + "/upscaling_model.bin");
-
-    // Launch cinematic color overlay in background
-    std::thread overlayThread(RunColorOverlay, ddaCtx.device.Get(), ddaCtx.context.Get(), ddaCtx.output1.Get());
-
-    std::vector<uint8_t> frame;
-    int w = 0, h = 0;
-    int frameCount = 0;
-    bool running = true;
-
-    auto lastFrameTime = std::chrono::steady_clock::now();
-    auto frameInterval = std::chrono::milliseconds(1000 / TARGET_HZ);
-
-    while (running)
-    {
-        auto now = std::chrono::steady_clock::now();
-
-        bool gotFrame = false;
-        if (ddaCtx.initialized) gotFrame = grab_frame_dda(ddaCtx, frame, w, h);
-        if (!gotFrame) gotFrame = grab_frame_gdi(frame, w, h);
-
-        if (gotFrame)
-        {
-            processFrameWithVerification(frame, w, h);
-
-            frameDataHistory.push_back(frame);
-            if (frameDataHistory.size() > 3) frameDataHistory.erase(frameDataHistory.begin());
-
-            present_via_dcomp(dcompCtx, frame, TARGET_W_DEFAULT, TARGET_H_DEFAULT);
-            frameCount++;
-
-            // Interpolated frames
-            auto interp = generateInterpolatedFrames(TARGET_W_DEFAULT, TARGET_H_DEFAULT);
-            for (const auto& f : interp) {
-                present_via_dcomp(dcompCtx, f, TARGET_W_DEFAULT, TARGET_H_DEFAULT);
-                frameCount++;
-            }
-
-            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) running = false;
-            if (frameCount % 300 == 0) {
-                upscalingModel.save(std::string(MODULES_DIR) + "/upscaling_model.bin");
+        // 3. Draw interpolated frames (if we have a previous frame)
+        if (!first) {
+            for (int i = 1; i <= fake_frames; ++i) {
+                float t = i / float(fake_frames + 1);
+                auto interp = interpolator.interpolate(prev, curr, t);
+                upload(interp);
             }
         }
 
-        sleep_until(lastFrameTime + frameInterval);
-        lastFrameTime = std::chrono::steady_clock::now();
+        // 4. Always draw the real (now enhanced) current frame last
+        upload(curr);
+
+        prev = curr;
+        first = false;
     }
 
-    // ——————— CLEANUP ———————
-    g_overlayRunning = false;
-    if (overlayThread.joinable()) overlayThread.join();
-
-    upscalingModel.save(std::string(MODULES_DIR) + "/upscaling_model.bin");
-    freeCudaMemory();
-    cleanupCuda();
-
-    printf("Supervisor shutdown complete.\n");
-}
-
-// -------------------- MAIN — short and beautiful --------------------
-int main()
-{
-    CoInitialize(nullptr);
-    initCuda();
-    ensure_dirs();
-    set_high_priority();
-
-    RunSupervisor();
-
-    CoUninitialize();
     return 0;
 }
